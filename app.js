@@ -72,6 +72,8 @@ const REF_TYPES = {
 };
 /* transient, in-memory only: which bucket ids have their tracking <details> open right now (not persisted, not saved) */
 const openTracking = new Set();
+/* transient, in-memory only: which bucket ids are collapsed/minimized to free up screen space (not saved) */
+const collapsedBuckets = new Set();
 let state = blankPlan();
 function blankPlan(){
   return { planName:"", po:"", shipFrom:"", readyDate:"", notes:"", products:[], buckets:[] };
@@ -330,9 +332,9 @@ function initCloudUI(){
     pullAndMerge({quiet:false});
   } else {
     setCloudState("off");
-    /* no local token: if a password-protected sync setup exists on another device, nudge (never blocking) */
+    /* no local token: if a sync setup already exists, nudge the user to sign in (never blocking) */
     fetchSyncConfigBlob().then(blob=>{
-      if(blob && !loadGhConfig().token){ toast("Click Cloud to unlock sync with your password"); }
+      if(blobHasSetup(blob) && !loadGhConfig().token){ toast("Click Cloud to sign in and sync your plans"); }
     }).catch(()=>{});
   }
 }
@@ -386,28 +388,47 @@ async function decryptToken(blob, password){
   const ptBuf = await crypto.subtle.decrypt({name:"AES-GCM", iv}, key, ct);
   return new TextDecoder().decode(ptBuf);
 }
+/* An email/username is only ever a lookup label. We hash it (SHA-256) so it is never written in
+   plaintext to the PUBLIC setup file; the accounts map is keyed by this hash. */
+function normId(s){ return String(s||"").trim().toLowerCase(); }
+async function sha256hex(str){
+  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(str));
+  return Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,"0")).join("");
+}
+/* sync-config.json (v2): {v:2, accounts:{ <sha256hex(normId)>: {salt,iv,ct} }} -- one encrypted token
+   per identity/password. v1 legacy was a single {v:1,salt,iv,ct} with no id; still readable below. */
+function blobAccounts(blob){
+  if(!blob || typeof blob!=="object") return {};
+  if(blob.accounts && typeof blob.accounts==="object") return blob.accounts;
+  if(blob.salt && blob.iv && blob.ct) return {__legacy__:{salt:blob.salt, iv:blob.iv, ct:blob.ct}};
+  return {};
+}
+function blobHasSetup(blob){ return Object.keys(blobAccounts(blob)).length > 0; }
 
 /* Session-cached lookup: undefined = not checked yet, null = confirmed absent, object = found blob. */
 let _syncConfigCache;
 /* Fetch sync-config.json unauthenticated from the PUBLIC app repo (raw first, api.github.com fallback). */
 async function fetchSyncConfigBlob(force){
   if(!force && _syncConfigCache !== undefined) return _syncConfigCache;
+  /* raw.githubusercontent.com is fast but CDN-cached: right after a fresh write it can lag or serve a
+     stale 404, so a 404 here is NOT authoritative. Always confirm against the Contents API (strongly
+     consistent) before concluding the setup file is absent -- otherwise a new device drops to the
+     token screen even though the login exists. */
   try{
     const rawUrl = "https://raw.githubusercontent.com/"+APP_REPO_OWNER+"/"+APP_REPO_NAME+"/"+APP_REPO_BRANCH+"/"+SYNC_CONFIG_PATH;
     const res = await fetch(rawUrl, {cache:"no-store"});
     if(res.ok){ _syncConfigCache = await res.json(); return _syncConfigCache; }
-    if(res.status!==404){ /* not a clean 404 (e.g. CDN hiccup); fall through to API fallback */ }
-    else { _syncConfigCache = null; return null; }
+    /* any non-200 (including 404): fall through to the authoritative API check below */
   }catch(e){ /* raw host unreachable; try API fallback below */ }
   try{
     const apiUrl = "https://api.github.com/repos/"+APP_REPO_OWNER+"/"+APP_REPO_NAME+"/contents/"+SYNC_CONFIG_PATH+"?ref="+APP_REPO_BRANCH;
-    const res2 = await fetch(apiUrl, {headers:{"Accept":"application/vnd.github+json"}});
+    const res2 = await fetch(apiUrl, {headers:{"Accept":"application/vnd.github+json"}, cache:"no-store"});
     if(res2.status===404){ _syncConfigCache = null; return null; }
-    if(!res2.ok){ return undefined===_syncConfigCache ? null : _syncConfigCache; }
+    if(!res2.ok){ return _syncConfigCache===undefined ? null : _syncConfigCache; }
     const data = await res2.json();
     _syncConfigCache = JSON.parse(b64DecodeUnicode(data.content));
     return _syncConfigCache;
-  }catch(e){ return null; }
+  }catch(e){ return _syncConfigCache===undefined ? null : _syncConfigCache; }
 }
 /* Get sha+parsed JSON of a file in a repo (generic, used for the app-repo sync-config.json push). */
 async function ghGetFileMeta(owner, repo, branch, path, token){
@@ -655,8 +676,16 @@ function renderProducts(){
   }).join("");
   $("#unassignedInfo").textContent = totLeft>0 ? totLeft+" of "+totCartons+" cartons unassigned" : "all "+totCartons+" cartons assigned";
 }
+function updateCollapseAllLabel(){
+  const btn = $("#btnCollapseAll"); if(!btn) return;
+  const ids = state.buckets.map(b=>b.id);
+  btn.style.display = ids.length>1 ? "" : "none";
+  const allCollapsed = ids.length>0 && ids.every(id=>collapsedBuckets.has(id));
+  btn.textContent = allCollapsed ? "Expand all" : "Collapse all";
+}
 function renderBuckets(){
   const grid = $("#bucketGrid");
+  updateCollapseAllLabel();
   const slices = cartonSlices();
   if(!state.buckets.length){
     grid.innerHTML = '<div class="hint" style="padding:20px;border:2px dashed var(--line);border-radius:10px">No shipments yet. Click "+ Add shipment" to create your first bucket (for example: Air to FBA, Ocean West to AWD).</div>';
@@ -684,13 +713,16 @@ function renderBuckets(){
       </tr>`;
     }).join("");
     const st = bStatus(b);
-    return `<div class="bucket mode-${b.mode}" data-bucket="${b.id}">
+    const collapsed = collapsedBuckets.has(b.id);
+    return `<div class="bucket mode-${b.mode}${collapsed?" collapsed":""}" data-bucket="${b.id}">
       <div class="bucket-h">
+        <button class="bcollapse" data-collapse="${b.id}" title="${collapsed?"Expand shipment":"Minimize shipment"}" aria-label="${collapsed?"Expand shipment":"Minimize shipment"}">${collapsed?"▸":"▾"}</button>
         <span class="modechip ${b.mode}">${MODES[b.mode]||b.mode}</span>
         ${st!=="planned"?`<span class="statuschip ${st}">${statusLabel(st)}</span>`:""}
         <input class="label" value="${escAttr(b.label||"")}" placeholder="Shipment name" data-blabel="${b.id}">
         <button class="rm" title="Delete shipment" data-delbucket="${b.id}" style="border:none;background:none;color:#b9c4d0;cursor:pointer">✕</button>
       </div>
+      ${collapsed ? `<div class="bucket-collapsed"><span>${t.cartons} ctns · ${fmt(t.units,0)} units · ${fmt(dispKg(t.kg),0)} ${weightUnitLabel()} · ${fmt(dispCbm(t.cbm),2)} ${volUnitLabel()}${q?` · ${fmt$(q)}`:""}${eta?` · ETA ${dstr(eta)}`:""}</span>${late.length?`<span class="late-cell">⚠ late</span>`:""}</div>` : `
       <div class="bucket-fields">
         <div class="field"><label>Mode</label>
           <select data-bmode="${b.id}">${Object.keys(MODES).map(m=>`<option value="${m}" ${m===b.mode?"selected":""}>${MODES[m]}</option>`).join("")}</select></div>
@@ -740,8 +772,9 @@ function renderBuckets(){
         </div>
         <div class="eta">ETA: <b>${eta?dstr(eta):"set ready date + transit"}</b>${eta&&!late.length?' <span class="ok">on time for all deadlines set</span>':""}</div>
         ${late.length?`<div class="warnflag">⚠ Arrives after need-by date: ${late.map(p=>esc(p.code)).join(", ")}. Consider moving those cartons to a faster shipment.</div>`:""}
-        <div class="bucket-actions"><button class="btn small" data-export="${b.id}">Export packing list</button></div>
+        <div class="bucket-actions"><button class="btn small" data-savebucket="${b.id}" title="Save the whole plan now so this shipment's changes aren't lost">Save</button><button class="btn small" data-export="${b.id}">Export packing list</button></div>
       </div>
+      `}
     </div>`;
   }).join("");
 }
@@ -866,6 +899,13 @@ $("#btnAddBucket").onclick = ()=>{
     status:"planned", carrier:"", refs:[], depDate:"", arrDate:""});
   render();
 };
+$("#btnCollapseAll").onclick = ()=>{
+  const ids = state.buckets.map(b=>b.id);
+  const anyExpanded = ids.some(id=>!collapsedBuckets.has(id));
+  if(anyExpanded) ids.forEach(id=>collapsedBuckets.add(id));   // some open -> minimize everything
+  else collapsedBuckets.clear();                                // all minimized -> expand everything
+  renderBuckets();
+};
 $("#btnExportAll").onclick = exportAll;
 
 // cloud sync UI
@@ -880,16 +920,26 @@ function renderCloudModalView(view){
   $("#ghAdvancedView").style.display = view==="advanced" ? "" : "none";
   $("#btnGhDisconnect").style.display = view==="connected" ? "" : "none";
   $("#ghStatus").textContent = "";
+  // Sign in / Sign up tabs are only meaningful on the two auth forms
+  const tabs = $("#ghTabs");
+  if(tabs){
+    tabs.style.display = (view==="unlock"||view==="setup") ? "" : "none";
+    $("#ghTabSignin").classList.toggle("active", view==="unlock");
+    $("#ghTabSignup").classList.toggle("active", view==="setup");
+  }
+  const title = $("#ghModalTitle");
   const toggle = $("#ghAdvancedToggle");
   const primary = $("#btnGhPrimary");
+  if(title){ title.textContent = view==="unlock" ? "Sign in" : view==="setup" ? "Sign up" : view==="advanced" ? "Advanced setup" : "Cloud sync"; }
   if(view==="detecting"){
     toggle.style.display = "none"; primary.style.display = "none";
   } else if(view==="setup"){
     toggle.style.display = ""; toggle.textContent = "Advanced: paste token directly";
-    primary.style.display = ""; primary.textContent = "Set up";
+    primary.style.display = ""; primary.textContent = "Sign up";
   } else if(view==="unlock"){
-    toggle.style.display = ""; toggle.textContent = "Advanced: paste token directly";
-    primary.style.display = ""; primary.textContent = "Unlock";
+    /* sign in never mentions a token; the token path lives on the Sign up tab / Advanced */
+    toggle.style.display = "none";
+    primary.style.display = ""; primary.textContent = "Sign in";
   } else if(view==="connected"){
     toggle.style.display = "none"; primary.style.display = "none";
   } else if(view==="advanced"){
@@ -917,17 +967,42 @@ async function openCloudModal(){
   const blob = await fetchSyncConfigBlob();
   // the modal may have been closed (or re-opened into another state) while we awaited; only act if still detecting
   if(cloudModalView!=="detecting") return;
-  if(blob){
+  const savedId = loadGhConfig().ident || "";
+  if(blobHasSetup(blob)){
+    // an account already exists -> default to Sign in, but both tabs stay visible so Sign up is one click away
     renderCloudModalView("unlock");
-    $("#ghUnlockPass").value = "";
+    $("#ghUnlockId").value = savedId; $("#ghUnlockPass").value = "";
+    setTimeout(()=>{ const el = savedId ? $("#ghUnlockPass") : $("#ghUnlockId"); if(el) el.focus(); }, 30);
   } else {
     renderCloudModalView("setup");
-    $("#ghSetupToken").value = ""; $("#ghSetupPass1").value = ""; $("#ghSetupPass2").value = "";
+    $("#ghSetupId").value = savedId; $("#ghSetupToken").value = ""; $("#ghSetupPass1").value = ""; $("#ghSetupPass2").value = "";
+    setTimeout(()=>{ const el = $("#ghSetupId"); if(el) el.focus(); }, 30);
   }
 }
 $("#btnCloud").onclick = openCloudModal;
 $("#btnGhClose").onclick = ()=>{ $("#cloudOverlay").classList.remove("show"); };
-$("#btnSync").onclick = ()=>{ pullAndMerge(); };
+/* Sync on a device that isn't signed in yet has nothing to pull -> open the sign in / sign up modal instead */
+$("#btnSync").onclick = ()=>{ if(!loadGhConfig().token){ openCloudModal(); return; } pullAndMerge(); };
+
+// Sign in / Sign up tabs -- carry the typed identifier across so switching never loses it
+$("#ghTabSignin").onclick = ()=>{
+  const id = $("#ghUnlockId").value || $("#ghSetupId").value || loadGhConfig().ident || "";
+  renderCloudModalView("unlock");
+  $("#ghUnlockId").value = id; $("#ghUnlockPass").value = "";
+  setTimeout(()=>{ const el = id ? $("#ghUnlockPass") : $("#ghUnlockId"); if(el) el.focus(); }, 20);
+};
+$("#ghTabSignup").onclick = ()=>{
+  const id = $("#ghSetupId").value || $("#ghUnlockId").value || loadGhConfig().ident || "";
+  renderCloudModalView("setup");
+  $("#ghSetupId").value = id;
+  setTimeout(()=>{ const el = id ? $("#ghSetupPass1") : $("#ghSetupId"); if(el) el.focus(); }, 20);
+};
+// Enter submits the visible primary action; Escape or a backdrop click closes the modal
+$("#cloudOverlay").addEventListener("keydown", e=>{
+  if(e.key==="Enter"){ const p=$("#btnGhPrimary"); if(p && p.style.display!=="none"){ e.preventDefault(); p.click(); } }
+  else if(e.key==="Escape"){ $("#btnGhClose").click(); }
+});
+$("#cloudOverlay").addEventListener("click", e=>{ if(e.target && e.target.id==="cloudOverlay") $("#btnGhClose").click(); });
 
 $("#ghAdvancedToggle").onclick = async (e)=>{
   e.preventDefault();
@@ -942,20 +1017,23 @@ $("#ghChangeLink").onclick = (e)=>{
   e.preventDefault();
   const cfg = loadGhConfig();
   renderCloudModalView("setup");
+  $("#ghSetupId").value = cfg.ident||"";
   $("#ghSetupToken").value = cfg.token||"";
   $("#ghSetupPass1").value = ""; $("#ghSetupPass2").value = "";
-  $("#ghStatus").textContent = "Prefilled with your current token. Choose a (new) password and press Set up to re-encrypt.";
+  $("#ghStatus").textContent = "Prefilled with your current token. Set an email/username + password and press Sign up to re-encrypt.";
 };
 
 async function doSetup(){
+  const ident = $("#ghSetupId").value.trim();
   const token = $("#ghSetupToken").value.trim();
   const p1 = $("#ghSetupPass1").value;
   const p2 = $("#ghSetupPass2").value;
+  if(!ident){ $("#ghStatus").textContent = "Enter an email or username."; return; }
   if(!token){ $("#ghStatus").textContent = "Please paste a token."; return; }
   if(!p1 || p1.length<8){ $("#ghStatus").textContent = "Choose a password (at least 8 characters, longer is safer)."; return; }
   if(p1!==p2){ $("#ghStatus").textContent = "Passwords don't match."; return; }
-  const cfg = {owner: GH_DEFAULTS.owner, repo: GH_DEFAULTS.repo, branch: GH_DEFAULTS.branch, token};
-  $("#ghStatus").textContent = "Testing token...";
+  const cfg = {owner: GH_DEFAULTS.owner, repo: GH_DEFAULTS.repo, branch: GH_DEFAULTS.branch, token, ident};
+  $("#ghStatus").textContent = "Checking token…";
   try{
     await ghGetPlans(cfg); // throws authError on 401/403; 404 (no plans.json yet) is fine
   }catch(err){
@@ -963,42 +1041,61 @@ async function doSetup(){
     else{ $("#ghStatus").textContent = "Could not reach GitHub: "+cloudErrorMessage(err); }
     return;
   }
-  $("#ghStatus").textContent = "Encrypting and uploading setup file...";
+  $("#ghStatus").textContent = "Encrypting and saving your login…";
   try{
+    const key = await sha256hex(normId(ident));
     const enc = await encryptToken(token, p1);
-    const blob = {v:1, salt:enc.salt, iv:enc.iv, ct:enc.ct};
-    await pushSyncConfigBlob(token, blob);
+    const existing = await fetchSyncConfigBlob(true);
+    const accounts = Object.assign({}, blobAccounts(existing));
+    delete accounts.__legacy__; // superseded by a real, identified account
+    accounts[key] = {salt:enc.salt, iv:enc.iv, ct:enc.ct};
+    await pushSyncConfigBlob(token, {v:2, accounts});
+    // verify the login is actually retrievable now, so a successful Sign up guarantees Sign in works elsewhere
+    const check = await fetchSyncConfigBlob(true);
+    if(!blobAccounts(check)[key]){ throw new Error("the setup file did not save correctly. Try again."); }
   }catch(err){
-    if(err && err.authError){ $("#ghStatus").textContent = "Token rejected on the shipsplit (app) repo. It needs Contents read/write there too."; return; }
-    $("#ghStatus").textContent = "Could not save the setup file: "+cloudErrorMessage(err);
+    if(err && err.authError){ $("#ghStatus").textContent = "Token rejected on the shipsplit (app) repo. It needs Contents read/write there too — that write access is what lets you sign in with a password on other devices."; return; }
+    $("#ghStatus").textContent = "Could not save your login: "+cloudErrorMessage(err);
     return;
   }
   saveGhConfig(cfg);
   setCloudState("on");
-  $("#ghStatus").textContent = "Connected. Merging plans...";
+  $("#ghStatus").textContent = "Signed up. Merging plans…";
   await pullAndMerge({quiet:true});
   renderCloudModalView("connected");
-  $("#ghStatus").textContent = "Connected.";
+  $("#ghStatus").textContent = "Connected. Sign in on any other device with your email/username + password.";
   toast("Cloud sync set up");
 }
 async function doUnlock(){
+  const ident = $("#ghUnlockId").value.trim();
   const pass = $("#ghUnlockPass").value;
+  if(!ident){ $("#ghStatus").textContent = "Enter your email or username."; return; }
   if(!pass){ $("#ghStatus").textContent = "Enter your password."; return; }
-  $("#ghStatus").textContent = "Unlocking...";
+  $("#ghStatus").textContent = "Signing in…";
   let blob;
   try{ blob = await fetchSyncConfigBlob(true); }catch(e){ blob = null; }
-  if(!blob){ $("#ghStatus").textContent = "Could not reach the setup file. Check your connection."; return; }
-  let token;
-  try{ token = await decryptToken(blob, pass); }
-  catch(e){ $("#ghStatus").textContent = "Wrong password."; return; }
-  const cfg = {owner: GH_DEFAULTS.owner, repo: GH_DEFAULTS.repo, branch: GH_DEFAULTS.branch, token};
+  if(!blob || !blobHasSetup(blob)){ $("#ghStatus").textContent = "No sync setup found yet. Use Sign up on a device that has your token."; return; }
+  const accounts = blobAccounts(blob);
+  const key = await sha256hex(normId(ident));
+  let token = null;
+  const exact = accounts[key];
+  if(exact){
+    try{ token = await decryptToken(exact, pass); }
+    catch(e){ $("#ghStatus").textContent = "Wrong password for that email/username."; return; }
+  } else {
+    // forgiving fallback: if exactly one login is stored, the identifier is effectively cosmetic -> try it
+    const keys = Object.keys(accounts);
+    if(keys.length===1){ try{ token = await decryptToken(accounts[keys[0]], pass); }catch(e){ token = null; } }
+    if(!token){ $("#ghStatus").textContent = "No saved login for that email/username. Check it, or use Sign up."; return; }
+  }
+  const cfg = {owner: GH_DEFAULTS.owner, repo: GH_DEFAULTS.repo, branch: GH_DEFAULTS.branch, token, ident};
   saveGhConfig(cfg);
   setCloudState("on");
-  $("#ghStatus").textContent = "Unlocked. Syncing...";
+  $("#ghStatus").textContent = "Signed in. Syncing…";
   await pullAndMerge({quiet:true});
   renderCloudModalView("connected");
   $("#ghStatus").textContent = "Connected.";
-  toast("Cloud sync unlocked");
+  toast("Signed in — cloud sync on");
 }
 async function doAdvancedConnect(){
   const owner = $("#ghOwner").value.trim() || GH_DEFAULTS.owner;
@@ -1090,6 +1187,8 @@ document.addEventListener("click", e=>{
   if(t.dataset.delbucket){ if(confirm("Delete this shipment?")){ state.buckets=state.buckets.filter(b=>b.id!==t.dataset.delbucket); render(); } }
   if(t.dataset.rmalloc){ const [bid,pid]=t.dataset.rmalloc.split("|"); delete bucketOf(bid).allocations[pid]; render(); }
   if(t.dataset.export){ exportBucket(bucketOf(t.dataset.export)); }
+  if(t.dataset.collapse){ const id=t.dataset.collapse; if(collapsedBuckets.has(id)) collapsedBuckets.delete(id); else collapsedBuckets.add(id); renderBuckets(); }
+  if(t.dataset.savebucket){ savePlan(false); }
   if(t.dataset.addref){
     const b = bucketOf(t.dataset.addref);
     if(b){ if(!b.refs) b.refs=[]; b.refs.push({type:"tracking", value:""}); openTracking.add(b.id); renderBuckets(); }

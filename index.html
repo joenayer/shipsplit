@@ -91,7 +91,10 @@
   .eta{font-size:12.5px;margin-top:4px}
   .eta .late{color:var(--red);font-weight:600}
   .eta .ok{color:var(--green)}
-  .bucket-actions{display:flex;gap:6px;margin-top:7px}
+  .bucket-actions{display:flex;gap:6px;margin-top:7px;flex-wrap:wrap}
+  .bucket-h .bcollapse{border:none;background:none;color:var(--muted);cursor:pointer;font-size:12px;line-height:1;padding:3px 2px}
+  .bucket-h .bcollapse:hover{color:var(--ink)}
+  .bucket-collapsed{padding:2px 12px 10px;font-size:12.5px;color:var(--muted);display:flex;gap:6px;flex-wrap:wrap;align-items:center}
   .warnflag{background:var(--red-soft);color:var(--red);border-radius:7px;padding:5px 8px;font-size:12px;margin-top:6px}
   /* status chip */
   .statuschip{font-size:11px;font-weight:700;padding:2px 9px;border-radius:20px;white-space:nowrap;border:none}
@@ -129,6 +132,10 @@
   .modal .mrow{display:flex;gap:8px;justify-content:flex-end;margin-top:14px}
   .modal input[type=number]{width:100%;border:1px solid var(--line);border-radius:7px;padding:8px;font-size:16px;text-align:right}
   .modal .sub{color:var(--muted);font-size:12px;margin-top:6px}
+  .ghtabs{display:flex;gap:6px;margin:2px 0 12px}
+  .ghtab{flex:1;border:1px solid var(--line);background:#fff;border-radius:7px;padding:7px 10px;cursor:pointer;font-size:13px;font-weight:600;color:var(--muted)}
+  .ghtab:hover{background:#eef3f8}
+  .ghtab.active{background:var(--blue-soft);border-color:var(--blue);color:var(--blue)}
   .toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);background:#12293f;color:#fff;padding:9px 18px;border-radius:8px;font-size:13px;opacity:0;transition:opacity .25s;z-index:200;pointer-events:none}
   .toast.show{opacity:1}
   .filedrop{border:2px dashed var(--line);border-radius:9px;padding:14px;text-align:center;color:var(--muted);font-size:12.5px;cursor:pointer;margin-bottom:10px}
@@ -213,6 +220,7 @@
       <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap">
         <h2 style="font-size:15px">Shipments</h2>
         <button class="btn primary" id="btnAddBucket">+ Add shipment</button>
+        <button class="btn" id="btnCollapseAll" style="display:none">Collapse all</button>
         <span class="hint">Drag a product onto a shipment, then set how many cartons go in.</span>
       </div>
       <div class="buckets" id="bucketGrid"></div>
@@ -246,22 +254,29 @@
 <!-- cloud sync settings modal -->
 <div class="overlay" id="cloudOverlay">
   <div class="modal" style="width:380px">
-    <h3>Cloud sync</h3>
+    <h3 id="ghModalTitle">Cloud sync</h3>
 
-    <div id="ghDetecting" class="sub">Checking...</div>
+    <div id="ghDetecting" class="sub">Checking…</div>
 
-    <div id="ghSetupView" style="display:none">
-      <div class="sub" style="margin-bottom:8px">First device: set a password to unlock sync on your other devices without pasting a token again.</div>
-      <div class="field" style="margin-bottom:8px"><label>Personal access token</label><input type="password" id="ghSetupToken" placeholder="github_pat_..."></div>
-      <div class="field" style="margin-bottom:8px"><label>Choose a sync password</label><input type="password" id="ghSetupPass1" placeholder="Password"></div>
-      <div class="field" style="margin-bottom:8px"><label>Confirm password</label><input type="password" id="ghSetupPass2" placeholder="Confirm password"></div>
-      <div class="sub">Needs a fine-grained token with Contents read/write access on both the <b>shipsplit</b> and <b>shipsplit-data</b> repos.</div>
-      <div class="sub">The encrypted setup file this creates is public, but it is useless without your password. Still, don't pick something trivial.</div>
+    <div class="ghtabs" id="ghTabs" style="display:none">
+      <button type="button" class="ghtab" id="ghTabSignin">Sign in</button>
+      <button type="button" class="ghtab" id="ghTabSignup">Sign up</button>
     </div>
 
     <div id="ghUnlockView" style="display:none">
-      <div class="sub" style="margin-bottom:8px">Sync is already set up on another device. Enter your password to unlock it here — no token needed.</div>
-      <div class="field" style="margin-bottom:8px"><label>Sync password</label><input type="password" id="ghUnlockPass" placeholder="Password"></div>
+      <div class="sub" style="margin-bottom:8px">Sign in to sync your plans on this device. No token needed — just the email or username and password from when you signed up.</div>
+      <div class="field" style="margin-bottom:8px"><label>Email or username</label><input id="ghUnlockId" autocomplete="username" placeholder="you@example.com"></div>
+      <div class="field" style="margin-bottom:8px"><label>Password</label><input type="password" id="ghUnlockPass" autocomplete="current-password" placeholder="Password"></div>
+    </div>
+
+    <div id="ghSetupView" style="display:none">
+      <div class="sub" style="margin-bottom:8px">Sign up once, on a device that has your GitHub token. After this you sign in anywhere with just your email/username and password — you never paste the token again.</div>
+      <div class="field" style="margin-bottom:8px"><label>Email or username</label><input id="ghSetupId" autocomplete="username" placeholder="you@example.com"></div>
+      <div class="field" style="margin-bottom:8px"><label>Password</label><input type="password" id="ghSetupPass1" autocomplete="new-password" placeholder="Choose a password (8+ characters)"></div>
+      <div class="field" style="margin-bottom:8px"><label>Confirm password</label><input type="password" id="ghSetupPass2" autocomplete="new-password" placeholder="Confirm password"></div>
+      <div class="field" style="margin-bottom:8px"><label>Personal access token</label><input type="password" id="ghSetupToken" autocomplete="off" placeholder="github_pat_…"></div>
+      <div class="sub">Needs a fine-grained token with Contents read/write on both the <b>shipsplit</b> and <b>shipsplit-data</b> repos — the write access on <b>shipsplit</b> is what makes password sign-in work on your other devices.</div>
+      <div class="sub">Your token is encrypted with your password before it's saved. The setup file is public but useless without the password — still, don't pick something trivial.</div>
     </div>
 
     <div id="ghConnectedView" style="display:none">
