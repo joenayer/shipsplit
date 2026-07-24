@@ -667,8 +667,8 @@ function safeName(s){ return s.replace(/[\\/:*?"<>|]/g,"-"); }
    in lb (US). Keys on each product's editable Amazon MSKU, falling back to its code. */
 function amazonUploadUrl(program){
   return program==="AWD"
-    ? "https://sellercentral.amazon.com/inventory-warehousing"                              // AWD console (inbound)
-    : "https://sellercentral.amazon.com/fba/sendtoamazon/confirm_content_step?upstream_storage=true"; // Send to Amazon
+    ? "https://sellercentral.amazon.com/fba/sendtoamazon/confirm_content_step?upstream_storage=true" // AWD = upstream storage
+    : "https://sellercentral.amazon.com/fba/sendtoamazon";                                           // FBA Send to Amazon
 }
 /* Per-SKU case-pack figures for this shipment (shared by the sheet and the prompt). */
 function amazonItems(b){
@@ -713,15 +713,48 @@ function amazonSheetAoa(b, program){
   }
   return {aoa, cols, isAWD, empty: !items.length, anyMixed, headerRowIndex: aoa.indexOf(cols)};
 }
+/* base64 of the AWD template to fill: a user-supplied one (localStorage) wins, else the embedded default */
+function getAwdTemplateB64(){ try{ return localStorage.getItem("shipsplit_awd_tpl") || (window.AWD_TEMPLATE_B64||""); }catch(e){ return (window.AWD_TEMPLATE_B64||""); } }
+/* Fill the OFFICIAL AWD template workbook (all tabs/metadata preserved) so Amazon accepts the upload.
+   Injects one data row per SKU below the "Merchant SKU" header of the "Create workflow – template" tab. */
+function fillAwdTemplate(b, items){
+  const b64 = getAwdTemplateB64();
+  if(!b64 || typeof XLSX==="undefined") return null;
+  let wb;
+  try{ wb = XLSX.read(b64, {type:"base64"}); }catch(e){ return null; }   // no cellStyles -> compact output
+  let sn = wb.SheetNames.find(n=>/create workflow.*template/i.test(n));
+  if(!sn){
+    sn = wb.SheetNames.find(n=>{
+      const g = XLSX.utils.sheet_to_json(wb.Sheets[n], {header:1, defval:null});
+      return g.some(r=>r && String(r[0]||"").trim().toLowerCase()==="merchant sku");
+    });
+  }
+  if(!sn) return null;
+  const ws = wb.Sheets[sn];
+  const grid = XLSX.utils.sheet_to_json(ws, {header:1, defval:null});
+  let hi = grid.findIndex(r=>r && String(r[0]||"").trim().toLowerCase()==="merchant sku");
+  if(hi<0) hi = 6;
+  const rows = items.map(it=>[it.msku, it.totalUnits, "", it.unitsPerBox, it.boxes, it.L, it.W, it.H, it.wt, "", "", ""]);
+  XLSX.utils.sheet_add_aoa(ws, rows, {origin:{r:hi+1, c:0}});
+  return wb;
+}
 function exportAmazonSheet(b, program){
   if(!b) return;
-  const {aoa, cols, isAWD, empty, anyMixed} = amazonSheetAoa(b, program);
-  if(empty){ toast("No cases assigned to this shipment yet."); return; }
-  const wb = XLSX.utils.book_new();
-  const ws = XLSX.utils.aoa_to_sheet(aoa);
-  ws["!cols"] = cols.map((c,i)=>({wch: i===0?18 : Math.max(10, String(c).length+2)}));
-  XLSX.utils.book_append_sheet(wb, ws, isAWD ? "Create workflow – template" : "FBA upload");
-  XLSX.writeFile(wb, safeName((state.planName||"plan")+" - "+(b.label||"shipment")+" - "+(isAWD?"AWD":"FBA")+" upload")+".xlsx");
+  const isAWD = program==="AWD";
+  const items = amazonItems(b);
+  if(!items.length){ toast("No cases assigned to this shipment yet."); return; }
+  const anyMixed = items.some(i=>i.mixed);
+  const fname = safeName((state.planName||"plan")+" - "+(b.label||"shipment")+" - "+(isAWD?"AWD":"FBA")+" upload")+".xlsx";
+  let wb = isAWD ? fillAwdTemplate(b, items) : null; // AWD: fill the real template so Amazon accepts it
+  if(!wb){
+    // FBA, or AWD template unavailable -> build the sheet from scratch
+    const {aoa, cols} = amazonSheetAoa(b, program);
+    wb = XLSX.utils.book_new();
+    const ws = XLSX.utils.aoa_to_sheet(aoa);
+    ws["!cols"] = cols.map((c,i)=>({wch: i===0?18 : Math.max(10, String(c).length+2)}));
+    XLSX.utils.book_append_sheet(wb, ws, isAWD ? "Create workflow – template" : "FBA upload");
+  }
+  XLSX.writeFile(wb, fname);
   toast((isAWD?"AWD":"FBA")+" sheet exported — click “Open "+(isAWD?"AWD":"FBA")+" upload” to finish on Amazon"+(anyMixed?" (some cases differ; used the first case per SKU)":""));
 }
 /* Deterministic, templated prompt for an agentic AI browser extension (no AI needed to build it). */
@@ -1439,7 +1472,7 @@ document.addEventListener("input", e=>{
 document.addEventListener("change", e=>{
   const t = e.target;
   if(t.dataset.bmode){ bucketOf(t.dataset.bmode).mode=t.value; render(); }
-  if(t.dataset.bdest){ bucketOf(t.dataset.bdest).destType=t.value; renderSummary(); }
+  if(t.dataset.bdest){ bucketOf(t.dataset.bdest).destType=t.value; renderBuckets(); renderSummary(); } // renderBuckets so the AWD/FBA export buttons re-evaluate
   if(t.dataset.bstatus){ const b=bucketOf(t.dataset.bstatus); if(b){ b.status=t.value; renderBuckets(); renderSummary(); } }
   if(t.dataset.bcarrier){ /* value already applied on input; nothing else depends on it visually */ }
   if(t.dataset.bdep){ const b=bucketOf(t.dataset.bdep); if(b){ b.depDate=t.value; renderBuckets(); renderSummary(); } }
