@@ -138,6 +138,9 @@
   .ghtab.active{background:var(--blue-soft);border-color:var(--blue);color:var(--blue)}
   .toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);background:#12293f;color:#fff;padding:9px 18px;border-radius:8px;font-size:13px;opacity:0;transition:opacity .25s;z-index:200;pointer-events:none}
   .toast.show{opacity:1}
+  .toast.undo{pointer-events:auto}
+  .undobtn{margin-left:10px;background:#2f6da8;color:#fff;border:none;border-radius:5px;padding:2px 9px;cursor:pointer;font-size:12px;font-weight:600}
+  .undobtn:hover{background:#3f7fbf}
   .filedrop{border:2px dashed var(--line);border-radius:9px;padding:14px;text-align:center;color:var(--muted);font-size:12.5px;cursor:pointer;margin-bottom:10px}
   .filedrop:hover,.filedrop.dragover{border-color:var(--blue);background:var(--blue-soft);color:var(--blue)}
   .addprod{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:8px}
@@ -151,16 +154,40 @@
   .prodsearch{width:100%;border:1px solid var(--line);border-radius:7px;padding:6px 9px;margin:0 0 9px;font-size:13px}
   .prodsearch:focus{outline:2px solid #bcd8f2;border-color:var(--blue)}
   .prod .prow-actions{display:flex;gap:6px;margin-top:6px}
-  .prod .pdimrow{margin-top:6px;display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+  .prod input.pcode{font-weight:600;font-size:13px;width:100%;border:1px solid transparent;border-radius:5px;padding:1px 4px;margin-left:-4px;background:transparent}
+  .prod input.pname{color:var(--muted);font-size:12px;width:100%;border:1px solid transparent;border-radius:5px;padding:1px 4px;margin:2px 0 0 -4px;background:transparent}
+  .prod input.pcode:hover,.prod input.pname:hover{border-color:var(--line)}
+  .prod input.pcode:focus,.prod input.pname:focus{border-color:var(--blue);background:#fff;outline:none}
+  .prod .pedit{display:flex;gap:10px;flex-wrap:wrap;margin-top:6px}
+  .prod .pedit label{font-size:11px;color:var(--muted);display:flex;align-items:center;gap:4px}
+  .prod .pedit input{border:1px solid var(--line);border-radius:6px;padding:2px 5px;font-size:11px;width:58px;text-align:right}
+  .prod .pdimrow{margin-top:6px;display:flex;align-items:center;gap:5px;flex-wrap:wrap}
   .prod .pdimrow label{font-size:11px;color:var(--muted)}
-  .prod .pdimrow input{border:1px solid var(--line);border-radius:6px;padding:2px 6px;font-size:11px;width:118px}
+  .prod .pdimrow .x{color:var(--muted);font-size:11px}
+  .prod .pdimrow input{border:1px solid var(--line);border-radius:6px;padding:2px 4px;font-size:11px;width:46px;text-align:center}
   .btn.assign{padding:3px 8px;font-size:12px;border-color:#bcd8f2;color:var(--blue)}
   .btn.assign:hover{background:var(--blue-soft)}
   #btnSave.dirty{position:relative}
   #btnSave.dirty::after{content:"";position:absolute;top:2px;right:2px;width:7px;height:7px;border-radius:50%;background:#ffcf6b;box-shadow:0 0 0 2px #12293f}
   .modal select{width:100%;border:1px solid var(--line);border-radius:7px;padding:8px;font-size:14px;background:#fff}
   .modal .field label{font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:3px;display:block}
+  .mchips{display:flex;gap:6px;margin-top:8px}
+  .synctime{font-size:11px;color:#9fb6cc;white-space:nowrap;align-self:center}
+  .bestcell{color:var(--green);font-weight:700}
+  .bymode{margin-top:8px;font-size:12px;color:var(--muted);display:flex;gap:6px 16px;flex-wrap:wrap}
+  .bymode b{color:var(--ink)}
+  .movebtn{border:none;background:none;color:#b9c4d0;cursor:pointer;font-size:12px;line-height:1;padding:0 1px}
+  .movebtn:hover{color:var(--blue)}
   @media(max-width:960px){#prodPanel{position:static;max-height:none}#prodList{max-height:45vh}}
+  @media print{
+    body{background:#fff}
+    header, #prodPanel, .buckets, .noprint{display:none !important}
+    main{max-width:none;padding:8px}
+    .cols{display:block}
+    .planbar,.panel{box-shadow:none !important;border:1px solid #bbb}
+    .planbar{margin-bottom:8px}
+    .summary{margin-top:8px}
+  }
 </style>
 </head>
 <body>
@@ -176,6 +203,7 @@
   <div class="hdr-group">
     <button class="btn ghost" id="btnCloud" title="Cloud sync settings">Cloud: off</button>
     <button class="btn ghost" id="btnSync" title="Pull latest plans from the cloud">Sync</button>
+    <span id="syncInfo" class="synctime"></span>
   </div>
   <div class="hdr-group" style="margin-left:auto">
     <button class="btn ghost" id="btnExportJson">Backup all plans</button>
@@ -197,7 +225,7 @@
   <div class="cols">
     <!-- LEFT: products -->
     <div class="panel" id="prodPanel">
-      <div class="panel-h"><h2>Products / cartons</h2><span class="hint" id="unassignedInfo"></span></div>
+      <div class="panel-h"><h2>Products / cases</h2><span class="hint" id="unassignedInfo"></span></div>
       <div class="panel-b">
         <div class="filedrop" id="fileDrop">Drop a packing list (.xlsx, .xls, .csv, .tsv) here or click to import</div>
         <input type="file" id="xlsxFile" accept=".xlsx,.xls,.csv,.tsv" hidden>
@@ -206,9 +234,9 @@
           <div class="addprod">
             <div class="field"><label>Code</label><input id="apCode" placeholder="PL-XXXX-0000"></div>
             <div class="field"><label>Name</label><input id="apName" placeholder="Product name"></div>
-            <div class="field"><label>Cartons</label><input id="apCartons" type="number" min="1" value="10"></div>
-            <div class="field"><label>Units per carton</label><input id="apQty" type="number" min="1" value="100"></div>
-            <div class="field"><label>Weight per carton</label>
+            <div class="field"><label>Cases</label><input id="apCartons" type="number" min="1" value="10"></div>
+            <div class="field"><label>Units per case</label><input id="apQty" type="number" min="1" value="100"></div>
+            <div class="field"><label>Weight per case</label>
               <div style="display:flex;gap:4px">
                 <input id="apKg" type="number" step="0.1" value="6" style="flex:1;min-width:0">
                 <select id="apKgUnit" style="width:62px"><option value="kg">kg</option><option value="lb">lb</option></select>
@@ -230,18 +258,19 @@
 
     <!-- RIGHT: buckets -->
     <div>
-      <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap">
+      <div class="noprint" style="display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap">
         <h2 style="font-size:15px">Shipments</h2>
         <button class="btn primary" id="btnAddBucket">+ Add shipment</button>
+        <button class="btn" id="btnQuickStart" style="display:none" title="Create Air, Ocean West and Ocean East shipments at once">Quick start: Air + Ocean W + Ocean E</button>
         <button class="btn" id="btnCollapseAll" style="display:none">Collapse all</button>
-        <span class="hint">Drag a product onto a shipment, then set how many cartons go in.</span>
+        <span class="hint">Drag or use “Assign →” to put cases into a shipment.</span>
       </div>
       <div class="buckets" id="bucketGrid"></div>
 
       <div class="summary panel" id="summaryPanel" style="margin-top:18px">
         <div class="panel-h">
           <div style="display:flex;align-items:center;gap:10px"><h2>Plan summary</h2><span class="hint" id="planProgress"></span></div>
-          <div style="display:flex;gap:6px">
+          <div class="noprint" style="display:flex;gap:6px">
             <button class="btn small" id="btnExportAll">Export all packing lists (.xlsx)</button>
             <button class="btn small" onclick="window.print()">Print</button>
           </div>
@@ -255,12 +284,13 @@
 <!-- count modal -->
 <div class="overlay" id="overlay">
   <div class="modal">
-    <h3 id="mTitle">How many cartons?</h3>
+    <h3 id="mTitle">How many cases?</h3>
     <div class="field" id="mBucketRow" style="display:none;margin-bottom:10px">
       <label>Shipment</label>
       <select id="mBucket"></select>
     </div>
     <input type="number" id="mCount" min="1">
+    <div class="mchips"><button type="button" class="btn small" data-mchip="half">Half</button><button type="button" class="btn small" data-mchip="all">All available</button></div>
     <div class="sub" id="mSub"></div>
     <div class="mrow">
       <button class="btn" id="mCancel">Cancel</button>
@@ -276,9 +306,9 @@
     <div class="addprod">
       <div class="field"><label>Code</label><input id="npCode" placeholder="PL-XXXX-0000"></div>
       <div class="field"><label>Name</label><input id="npName" placeholder="Product name"></div>
-      <div class="field"><label>Cartons</label><input id="npCartons" type="number" min="1" value="10"></div>
-      <div class="field"><label>Units per carton</label><input id="npQty" type="number" min="1" value="100"></div>
-      <div class="field"><label>Weight per carton</label>
+      <div class="field"><label>Cases</label><input id="npCartons" type="number" min="1" value="10"></div>
+      <div class="field"><label>Units per case</label><input id="npQty" type="number" min="1" value="100"></div>
+      <div class="field"><label>Weight per case</label>
         <div style="display:flex;gap:4px">
           <input id="npKg" type="number" step="0.1" value="6" style="flex:1;min-width:0">
           <select id="npKgUnit" style="width:62px"><option value="kg">kg</option><option value="lb">lb</option></select>
