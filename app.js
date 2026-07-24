@@ -772,7 +772,7 @@ function buildShipmentPrompt(b){
   p.push(`- Destination: ${dest}`);
   if(state.shipFrom) p.push(`- Ship from: ${state.shipFrom}`);
   p.push(`- Start page: ${url}`);
-  p.push(`- Prep owner and labeling owner: Seller (default). No pallets. No expiration dates.`);
+  p.push(`- Prep owner and labeling owner: Seller (default).`);
   p.push("");
   p.push(`Items (${items.length} SKU${items.length===1?"":"s"}):`);
   p.push(`| Merchant SKU | Total units | Units per box | Number of boxes | Box L x W x H (in) | Box weight (lb) |`);
@@ -783,7 +783,7 @@ function buildShipmentPrompt(b){
   p.push(`1. Open the start page above in Amazon Seller Central.`);
   p.push(`2. Begin a new ${isAWD?"AWD inbound":"Send to Amazon"} workflow.`);
   p.push(`3. Add each Merchant SKU as a case-packed / boxed item using its exact units per box and number of boxes.`);
-  p.push(`4. Enter each box's dimensions (inches) and weight (pounds) exactly as listed.`);
+  p.push(`4. If a SKU already has a saved case/box template for that units-per-box quantity, select and reuse the existing template — do NOT create a new one or edit its dimensions. Only when no matching template exists, enter the box dimensions (inches) and weight (pounds) as listed above.`);
   p.push(`5. Set prep owner = Seller and labeling owner = Seller.`);
   p.push(`6. STOP at the final review screen — do NOT submit or confirm. Summarize what you entered, and flag any Merchant SKU not found in my catalog, so I can verify before submitting myself.`);
   return p.join("\n");
