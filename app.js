@@ -660,6 +660,60 @@ function exportAll(){
   XLSX.writeFile(wb, safeName((state.planName||"plan")+" - all shipments")+".xlsx");
 }
 function safeName(s){ return s.replace(/[\\/:*?"<>|]/g,"-"); }
+/* ---- Amazon inbound (FBA / AWD) case-pack upload sheet ----
+   Amazon's FBA "Send to Amazon" case-pack file and the AWD inbound bulk-upload file share the same core
+   fields: MSKU, units per case, number of cases, case L/W/H, case weight. We emit inches + pounds (US) and
+   key on each product's editable Amazon MSKU (falling back to its code). It's a starting sheet: column names
+   are versioned per Seller Central, so the user maps it to their current template. */
+function amazonUploadUrl(program){
+  return program==="AWD"
+    ? "https://sellercentral.amazon.com/inventory-warehousing"   // AWD console (inbound)
+    : "https://sellercentral.amazon.com/fba/sendtoamazon";       // FBA Send to Amazon
+}
+/* Build the case-pack sheet as an array-of-arrays (separated out so it can be unit-tested). */
+function amazonSheetAoa(b, program){
+  const isAWD = program==="AWD";
+  const rows = (cartonSlices()[b.id]||[]);
+  const aoa = [];
+  aoa.push(["AMAZON "+(isAWD?"AWD":"FBA")+" INBOUND — "+(state.planName||"plan")+" / "+(b.label||MODES[b.mode])]);
+  aoa.push(["Destination", (DEST_TYPES[b.destType]||"")+(b.shipTo?" — "+b.shipTo:"")]);
+  aoa.push(["Ship from", state.shipFrom||""]);
+  aoa.push(["Date", new Date().toISOString().slice(0,10)]);
+  aoa.push(["Note", "Case-packed format, dims in inches / weight in lb. Confirm the column names against your current Seller Central "+(isAWD?"AWD inbound":"Send to Amazon")+" upload template before uploading."]);
+  aoa.push([]);
+  const cols = isAWD
+    ? ["MSKU","Title","Units per case","Number of cases","Total units","Case length (in)","Case width (in)","Case height (in)","Case weight (lb)","Expiration date"]
+    : ["MSKU","Title","Units per case","Number of cases","Total units","Case length (in)","Case width (in)","Case height (in)","Case weight (lb)","Prep owner","Labeling owner","Expiration date"];
+  aoa.push(cols);
+  let anyMixed = false;
+  rows.forEach(r=>{
+    const p = r.prod, cs = r.cartons;
+    const cases = cs.length;
+    const upc = cs[0] ? (cs[0].qty||0) : 0;
+    const totUnits = cs.reduce((s,c)=>s+(c.qty||0),0);
+    if(cs.some(c=>(c.qty||0)!==upc || c.dim!==(cs[0]||{}).dim || (c.kg||0)!==((cs[0]||{}).kg||0))) anyMixed = true;
+    const d = parseDim(cs[0]?cs[0].dim:"");
+    const L = d? +(d[0]*CM2IN).toFixed(2) : "";
+    const W = d? +(d[1]*CM2IN).toFixed(2) : "";
+    const H = d? +(d[2]*CM2IN).toFixed(2) : "";
+    const wt = cs[0] ? +((cs[0].kg||0)*KG2LB).toFixed(2) : "";
+    const msku = (p.msku && String(p.msku).trim()) || p.code;
+    const base = [msku, p.name||"", upc, cases, totUnits, L, W, H, wt];
+    aoa.push(isAWD ? base.concat([""]) : base.concat(["","",""]));
+  });
+  return {aoa, isAWD, empty: !rows.length, anyMixed};
+}
+function exportAmazonSheet(b, program){
+  if(!b) return;
+  const {aoa, isAWD, empty, anyMixed} = amazonSheetAoa(b, program);
+  if(empty){ toast("No cases assigned to this shipment yet."); return; }
+  const wb = XLSX.utils.book_new();
+  const ws = XLSX.utils.aoa_to_sheet(aoa);
+  ws["!cols"] = (isAWD?[18,26,13,14,10,15,15,15,15,14]:[18,26,13,14,10,15,15,15,15,12,13,14]).map(w=>({wch:w}));
+  XLSX.utils.book_append_sheet(wb, ws, (isAWD?"AWD":"FBA")+" upload");
+  XLSX.writeFile(wb, safeName((state.planName||"plan")+" - "+(b.label||"shipment")+" - "+(isAWD?"AWD":"FBA")+" upload")+".xlsx");
+  toast((isAWD?"AWD":"FBA")+" sheet exported — click “Open "+(isAWD?"AWD":"FBA")+" upload” to finish on Amazon"+(anyMixed?" (note: some cases differ; used the first case per SKU)":""));
+}
 
 /* ================= render ================= */
 /* dirty indicator: has the plan changed since it was last saved/opened this session? */
@@ -725,6 +779,7 @@ function renderProducts(){
           <label title="Units in each case">units/case <input type="number" min="0" data-pqty="${p.id}" value="${qty0}"></label>
           <label title="Weight of each case">${weightUnitLabel()}/case <input type="number" min="0" step="0.1" data-pkg="${p.id}" value="${kg0}"></label>
         </div>
+        <div class="pmsku"><label title="Amazon Merchant SKU used on the FBA/AWD upload sheets — leave blank to use the code above">Amazon MSKU <input data-pmsku="${p.id}" value="${escAttr(p.msku||"")}" placeholder="${escAttr(p.code)}" spellcheck="false"></label></div>
         <div class="pdimrow">
           <label>case (${unit})</label>
           <input data-pdim="${p.id}" value="${escAttr(dv[0])}" placeholder="L" title="Length — applies to all ${p.cartons.length} cases" inputmode="decimal">
@@ -786,6 +841,8 @@ function renderBuckets(){
     }).join("");
     const st = bStatus(b);
     const collapsed = collapsedBuckets.has(b.id);
+    // Amazon inbound upload sheet offered based on the destination: AWD -> AWD sheet, FBA (split/non-split) -> FBA sheet
+    const amz = b.destType==="awd" ? "AWD" : (b.destType==="fba-split"||b.destType==="fba") ? "FBA" : "";
     return `<div class="bucket mode-${b.mode}${collapsed?" collapsed":""}" data-bucket="${b.id}">
       <div class="bucket-h">
         <button class="bcollapse" data-collapse="${b.id}" title="${collapsed?"Expand shipment":"Minimize shipment"}" aria-label="${collapsed?"Expand shipment":"Minimize shipment"}">${collapsed?"▸":"▾"}</button>
@@ -847,7 +904,7 @@ function renderBuckets(){
         </div>
         <div class="eta">ETA: <b>${eta?dstr(eta):"set ready date + transit"}</b>${eta&&!late.length?' <span class="ok">on time for all deadlines set</span>':""}</div>
         ${late.length?`<div class="warnflag">⚠ Arrives after need-by date: ${late.map(p=>esc(p.code)).join(", ")}. Consider moving those cases to a faster shipment.</div>`:""}
-        <div class="bucket-actions"><button class="btn small" data-savebucket="${b.id}" title="Save the whole plan now so this shipment's changes aren't lost">Save</button><button class="btn small" data-dupbucket="${b.id}" title="Create a copy with the same settings and no cases">Duplicate</button><button class="btn small" data-export="${b.id}">Export packing list</button></div>
+        <div class="bucket-actions"><button class="btn small" data-savebucket="${b.id}" title="Save the whole plan now so this shipment's changes aren't lost">Save</button><button class="btn small" data-dupbucket="${b.id}" title="Create a copy with the same settings and no cases">Duplicate</button><button class="btn small" data-export="${b.id}">Export packing list</button>${amz?`<button class="btn small amzbtn" data-amzsheet="${b.id}|${amz}" title="Download a case-packed ${amz} inbound upload sheet for this shipment">Export ${amz} sheet</button><a class="btn small amzlink" href="${amazonUploadUrl(amz)}" target="_blank" rel="noopener" title="Open Amazon Seller Central to upload the ${amz} sheet">Open ${amz} upload ↗</a>`:""}</div>
       </div>
       `}
     </div>`;
@@ -1317,6 +1374,7 @@ document.addEventListener("input", e=>{
   // editable product code/name: update state live; dependent views refresh on commit ("change") below
   if(t.dataset.pcode){ const p=state.products.find(x=>x.id===t.dataset.pcode); if(p) p.code=t.value; }
   if(t.dataset.pname){ const p=state.products.find(x=>x.id===t.dataset.pname); if(p) p.name=t.value; }
+  if(t.dataset.pmsku){ const p=state.products.find(x=>x.id===t.dataset.pmsku); if(p) p.msku=t.value; }
   updateSaveIndicator();
 });
 document.addEventListener("change", e=>{
@@ -1388,6 +1446,7 @@ document.addEventListener("click", e=>{
       showUndo('Removed '+((p&&p.code)||"product")+' from '+(b.label||MODES[b.mode]), ()=>{ b.allocations[pid]=prev; render(); }); }
   }
   if(t.dataset.export){ exportBucket(bucketOf(t.dataset.export)); }
+  if(t.dataset.amzsheet){ const [bid,prog]=t.dataset.amzsheet.split("|"); exportAmazonSheet(bucketOf(bid), prog); }
   if(t.dataset.collapse){ const id=t.dataset.collapse; if(collapsedBuckets.has(id)) collapsedBuckets.delete(id); else collapsedBuckets.add(id); renderBuckets(); }
   if(t.dataset.savebucket){ savePlan(false); }
   if(t.dataset.assign){ const p=state.products.find(x=>x.id===t.dataset.assign); if(p) openCountModal(p, null); }
