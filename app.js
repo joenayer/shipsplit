@@ -661,58 +661,108 @@ function exportAll(){
 }
 function safeName(s){ return s.replace(/[\\/:*?"<>|]/g,"-"); }
 /* ---- Amazon inbound (FBA / AWD) case-pack upload sheet ----
-   Amazon's FBA "Send to Amazon" case-pack file and the AWD inbound bulk-upload file share the same core
-   fields: MSKU, units per case, number of cases, case L/W/H, case weight. We emit inches + pounds (US) and
-   key on each product's editable Amazon MSKU (falling back to its code). It's a starting sheet: column names
-   are versioned per Seller Central, so the user maps it to their current template. */
+   AWD sheet is a byte-for-byte match of the official "AWD Inbound File Upload Template V2" (Create workflow –
+   template tab): prep/labeling-owner header block + the exact 12-column, case-packed header. FBA uses the same
+   Send-to-Amazon case-pack fields (best-effort — column names are versioned per account). Dims in inches, weight
+   in lb (US). Keys on each product's editable Amazon MSKU, falling back to its code. */
 function amazonUploadUrl(program){
   return program==="AWD"
-    ? "https://sellercentral.amazon.com/inventory-warehousing"   // AWD console (inbound)
-    : "https://sellercentral.amazon.com/fba/sendtoamazon";       // FBA Send to Amazon
+    ? "https://sellercentral.amazon.com/inventory-warehousing"                              // AWD console (inbound)
+    : "https://sellercentral.amazon.com/fba/sendtoamazon/confirm_content_step?upstream_storage=true"; // Send to Amazon
 }
-/* Build the case-pack sheet as an array-of-arrays (separated out so it can be unit-tested). */
+/* Per-SKU case-pack figures for this shipment (shared by the sheet and the prompt). */
+function amazonItems(b){
+  return (cartonSlices()[b.id]||[]).map(r=>{
+    const p = r.prod, cs = r.cartons;
+    const d = parseDim(cs[0]?cs[0].dim:"");
+    return {
+      msku: (p.msku && String(p.msku).trim()) || p.code,
+      name: p.name||"",
+      boxes: cs.length,
+      unitsPerBox: cs[0] ? (cs[0].qty||0) : 0,
+      totalUnits: cs.reduce((s,c)=>s+(c.qty||0),0),
+      L: d? +(d[0]*CM2IN).toFixed(2) : "",
+      W: d? +(d[1]*CM2IN).toFixed(2) : "",
+      H: d? +(d[2]*CM2IN).toFixed(2) : "",
+      wt: cs[0] ? +((cs[0].kg||0)*KG2LB).toFixed(2) : "",
+      mixed: (()=>{ const u=cs[0]?cs[0].qty:0; return cs.some(c=>(c.qty||0)!==u || c.dim!==(cs[0]||{}).dim || (c.kg||0)!==((cs[0]||{}).kg||0)); })()
+    };
+  });
+}
+/* Build the sheet as an array-of-arrays (separated out so it can be unit-tested). */
 function amazonSheetAoa(b, program){
   const isAWD = program==="AWD";
-  const rows = (cartonSlices()[b.id]||[]);
-  const aoa = [];
-  aoa.push(["AMAZON "+(isAWD?"AWD":"FBA")+" INBOUND — "+(state.planName||"plan")+" / "+(b.label||MODES[b.mode])]);
-  aoa.push(["Destination", (DEST_TYPES[b.destType]||"")+(b.shipTo?" — "+b.shipTo:"")]);
-  aoa.push(["Ship from", state.shipFrom||""]);
-  aoa.push(["Date", new Date().toISOString().slice(0,10)]);
-  aoa.push(["Note", "Case-packed format, dims in inches / weight in lb. Confirm the column names against your current Seller Central "+(isAWD?"AWD inbound":"Send to Amazon")+" upload template before uploading."]);
-  aoa.push([]);
-  const cols = isAWD
-    ? ["MSKU","Title","Units per case","Number of cases","Total units","Case length (in)","Case width (in)","Case height (in)","Case weight (lb)","Expiration date"]
-    : ["MSKU","Title","Units per case","Number of cases","Total units","Case length (in)","Case width (in)","Case height (in)","Case weight (lb)","Prep owner","Labeling owner","Expiration date"];
-  aoa.push(cols);
-  let anyMixed = false;
-  rows.forEach(r=>{
-    const p = r.prod, cs = r.cartons;
-    const cases = cs.length;
-    const upc = cs[0] ? (cs[0].qty||0) : 0;
-    const totUnits = cs.reduce((s,c)=>s+(c.qty||0),0);
-    if(cs.some(c=>(c.qty||0)!==upc || c.dim!==(cs[0]||{}).dim || (c.kg||0)!==((cs[0]||{}).kg||0))) anyMixed = true;
-    const d = parseDim(cs[0]?cs[0].dim:"");
-    const L = d? +(d[0]*CM2IN).toFixed(2) : "";
-    const W = d? +(d[1]*CM2IN).toFixed(2) : "";
-    const H = d? +(d[2]*CM2IN).toFixed(2) : "";
-    const wt = cs[0] ? +((cs[0].kg||0)*KG2LB).toFixed(2) : "";
-    const msku = (p.msku && String(p.msku).trim()) || p.code;
-    const base = [msku, p.name||"", upc, cases, totUnits, L, W, H, wt];
-    aoa.push(isAWD ? base.concat([""]) : base.concat(["","",""]));
-  });
-  return {aoa, isAWD, empty: !rows.length, anyMixed};
+  const items = amazonItems(b);
+  const anyMixed = items.some(i=>i.mixed);
+  let aoa, cols;
+  if(isAWD){
+    // Exact layout of the official AWD Inbound File Upload Template V2 "Create workflow – template" tab
+    cols = ["Merchant SKU","Quantity","Expiration date (MM/DD/YYYY)","Units per box ","Number of boxes","Box length (in)","Box width (in)","Box height (in)","Box weight (lb)","Palletized?","Boxes Per Pallet","Number of pallets "];
+    // A1 note keeps the layout aligned with the official template (prep owner at row 3, header at row 7) —
+    // leading blank rows would otherwise be dropped on write, shifting every row up.
+    aoa = [ ["ShipSplit inbound — "+(state.planName||"plan")+" / "+(b.label||MODES[b.mode])], [],
+      ["Default prep owner","Seller"], ["Default labeling owner","Seller"], [],
+      ["Mandatory","","Optional","Mandatory","","","","","","","Mandatory if palletized",""], cols ];
+    items.forEach(it=> aoa.push([it.msku, it.totalUnits, "", it.unitsPerBox, it.boxes, it.L, it.W, it.H, it.wt, "", "", ""]));
+  } else {
+    // FBA (Send to Amazon), case-packed — same box fields; map to your current Send to Amazon template if needed
+    cols = ["Merchant SKU","Quantity","Units per box","Number of boxes","Box length (in)","Box width (in)","Box height (in)","Box weight (lb)"];
+    aoa = [ ["Send to Amazon — case-packed, no pallets, no expiration dates. Confirm columns against your current Send to Amazon template. Dims in inches, weight in lb."], [],
+      ["Default prep owner","Seller"], ["Default labeling owner","Seller"], [], cols ];
+    items.forEach(it=> aoa.push([it.msku, it.totalUnits, it.unitsPerBox, it.boxes, it.L, it.W, it.H, it.wt]));
+  }
+  return {aoa, cols, isAWD, empty: !items.length, anyMixed, headerRowIndex: aoa.indexOf(cols)};
 }
 function exportAmazonSheet(b, program){
   if(!b) return;
-  const {aoa, isAWD, empty, anyMixed} = amazonSheetAoa(b, program);
+  const {aoa, cols, isAWD, empty, anyMixed} = amazonSheetAoa(b, program);
   if(empty){ toast("No cases assigned to this shipment yet."); return; }
   const wb = XLSX.utils.book_new();
   const ws = XLSX.utils.aoa_to_sheet(aoa);
-  ws["!cols"] = (isAWD?[18,26,13,14,10,15,15,15,15,14]:[18,26,13,14,10,15,15,15,15,12,13,14]).map(w=>({wch:w}));
-  XLSX.utils.book_append_sheet(wb, ws, (isAWD?"AWD":"FBA")+" upload");
+  ws["!cols"] = cols.map((c,i)=>({wch: i===0?18 : Math.max(10, String(c).length+2)}));
+  XLSX.utils.book_append_sheet(wb, ws, isAWD ? "Create workflow – template" : "FBA upload");
   XLSX.writeFile(wb, safeName((state.planName||"plan")+" - "+(b.label||"shipment")+" - "+(isAWD?"AWD":"FBA")+" upload")+".xlsx");
-  toast((isAWD?"AWD":"FBA")+" sheet exported — click “Open "+(isAWD?"AWD":"FBA")+" upload” to finish on Amazon"+(anyMixed?" (note: some cases differ; used the first case per SKU)":""));
+  toast((isAWD?"AWD":"FBA")+" sheet exported — click “Open "+(isAWD?"AWD":"FBA")+" upload” to finish on Amazon"+(anyMixed?" (some cases differ; used the first case per SKU)":""));
+}
+/* Deterministic, templated prompt for an agentic AI browser extension (no AI needed to build it). */
+function buildShipmentPrompt(b){
+  const isAWD = b.destType==="awd";
+  const progName = isAWD ? "Amazon Warehousing & Distribution (AWD)" : "Amazon FBA (Send to Amazon)";
+  const items = amazonItems(b);
+  const url = amazonUploadUrl(isAWD?"AWD":"FBA");
+  const dest = (DEST_TYPES[b.destType]||"") + (b.shipTo?" — "+b.shipTo:"");
+  const p = [];
+  p.push(`You are operating my Amazon Seller Central account in this browser tab. Create a new inbound shipment to ${progName} from the data below. Every item is CASE-PACKED (single-SKU boxes).`);
+  p.push("");
+  p.push("Context");
+  p.push(`- Program: ${progName}`);
+  p.push(`- Destination: ${dest}`);
+  if(state.shipFrom) p.push(`- Ship from: ${state.shipFrom}`);
+  p.push(`- Start page: ${url}`);
+  p.push(`- Prep owner and labeling owner: Seller (default). No pallets. No expiration dates.`);
+  p.push("");
+  p.push(`Items (${items.length} SKU${items.length===1?"":"s"}):`);
+  p.push(`| Merchant SKU | Total units | Units per box | Number of boxes | Box L x W x H (in) | Box weight (lb) |`);
+  p.push(`| --- | --- | --- | --- | --- | --- |`);
+  items.forEach(it=> p.push(`| ${it.msku} | ${it.totalUnits} | ${it.unitsPerBox} | ${it.boxes} | ${it.L} x ${it.W} x ${it.H} | ${it.wt} |`));
+  p.push("");
+  p.push("Steps");
+  p.push(`1. Open the start page above in Amazon Seller Central.`);
+  p.push(`2. Begin a new ${isAWD?"AWD inbound":"Send to Amazon"} workflow.`);
+  p.push(`3. Add each Merchant SKU as a case-packed / boxed item using its exact units per box and number of boxes.`);
+  p.push(`4. Enter each box's dimensions (inches) and weight (pounds) exactly as listed.`);
+  p.push(`5. Set prep owner = Seller and labeling owner = Seller.`);
+  p.push(`6. STOP at the final review screen — do NOT submit or confirm. Summarize what you entered, and flag any Merchant SKU not found in my catalog, so I can verify before submitting myself.`);
+  return p.join("\n");
+}
+function openPromptModal(b){
+  if(!b) return;
+  if(!amazonItems(b).length){ toast("No cases assigned to this shipment yet."); return; }
+  const program = b.destType==="awd" ? "AWD" : "FBA";
+  $("#promptTitle").textContent = "Create "+program+" shipment prompt — "+(b.label||MODES[b.mode]);
+  $("#promptText").value = buildShipmentPrompt(b);
+  $("#promptOverlay").classList.add("show");
+  setTimeout(()=>{ const ta=$("#promptText"); if(ta){ ta.focus(); ta.select(); ta.scrollTop=0; } }, 50);
 }
 
 /* ================= render ================= */
@@ -904,7 +954,7 @@ function renderBuckets(){
         </div>
         <div class="eta">ETA: <b>${eta?dstr(eta):"set ready date + transit"}</b>${eta&&!late.length?' <span class="ok">on time for all deadlines set</span>':""}</div>
         ${late.length?`<div class="warnflag">⚠ Arrives after need-by date: ${late.map(p=>esc(p.code)).join(", ")}. Consider moving those cases to a faster shipment.</div>`:""}
-        <div class="bucket-actions"><button class="btn small" data-savebucket="${b.id}" title="Save the whole plan now so this shipment's changes aren't lost">Save</button><button class="btn small" data-dupbucket="${b.id}" title="Create a copy with the same settings and no cases">Duplicate</button><button class="btn small" data-export="${b.id}">Export packing list</button>${amz?`<button class="btn small amzbtn" data-amzsheet="${b.id}|${amz}" title="Download a case-packed ${amz} inbound upload sheet for this shipment">Export ${amz} sheet</button><a class="btn small amzlink" href="${amazonUploadUrl(amz)}" target="_blank" rel="noopener" title="Open Amazon Seller Central to upload the ${amz} sheet">Open ${amz} upload ↗</a>`:""}</div>
+        <div class="bucket-actions"><button class="btn small" data-savebucket="${b.id}" title="Save the whole plan now so this shipment's changes aren't lost">Save</button><button class="btn small" data-dupbucket="${b.id}" title="Create a copy with the same settings and no cases">Duplicate</button><button class="btn small" data-export="${b.id}">Export packing list</button>${amz?`<button class="btn small amzbtn" data-amzsheet="${b.id}|${amz}" title="Download a case-packed ${amz} inbound upload sheet for this shipment">Export ${amz} sheet</button><a class="btn small amzlink" href="${amazonUploadUrl(amz)}" target="_blank" rel="noopener" title="Open Amazon Seller Central to upload the ${amz} sheet">Open ${amz} upload ↗</a><button class="btn small amzprompt" data-prompt="${b.id}" title="Generate a ready-to-paste prompt for an AI browser extension to create this shipment on Amazon">Create prompt ✨</button>`:""}</div>
       </div>
       `}
     </div>`;
@@ -1079,6 +1129,15 @@ $("#npOk").onclick = ()=>{
 };
 $("#npOverlay").addEventListener("click", e=>{ if(e.target && e.target.id==="npOverlay"){ $("#npOverlay").classList.remove("show"); npCtx=null; } });
 $("#npOverlay").addEventListener("keydown", e=>{ if(e.key==="Escape") $("#npCancel").click(); });
+// AI-extension prompt modal
+$("#promptClose").onclick = ()=>{ $("#promptOverlay").classList.remove("show"); };
+$("#promptCopy").onclick = async ()=>{
+  const ta = $("#promptText");
+  try{ await navigator.clipboard.writeText(ta.value); toast("Prompt copied — paste it into your AI browser extension"); }
+  catch(e){ ta.focus(); ta.select(); try{ document.execCommand("copy"); toast("Prompt copied"); }catch(e2){ toast("Press Ctrl/Cmd+C to copy"); } }
+};
+$("#promptOverlay").addEventListener("click", e=>{ if(e.target && e.target.id==="promptOverlay") $("#promptOverlay").classList.remove("show"); });
+$("#promptOverlay").addEventListener("keydown", e=>{ if(e.key==="Escape") $("#promptClose").click(); });
 // add bucket
 $("#btnAddBucket").onclick = ()=>{
   state.buckets.push({id:uid(), label:"Shipment "+(state.buckets.length+1), mode:"ocean-west", destType:"fba-split", shipTo:"", quote:"", transit:"", allocations:{},
@@ -1447,6 +1506,7 @@ document.addEventListener("click", e=>{
   }
   if(t.dataset.export){ exportBucket(bucketOf(t.dataset.export)); }
   if(t.dataset.amzsheet){ const [bid,prog]=t.dataset.amzsheet.split("|"); exportAmazonSheet(bucketOf(bid), prog); }
+  if(t.dataset.prompt){ openPromptModal(bucketOf(t.dataset.prompt)); }
   if(t.dataset.collapse){ const id=t.dataset.collapse; if(collapsedBuckets.has(id)) collapsedBuckets.delete(id); else collapsedBuckets.add(id); renderBuckets(); }
   if(t.dataset.savebucket){ savePlan(false); }
   if(t.dataset.assign){ const p=state.products.find(x=>x.id===t.dataset.assign); if(p) openCountModal(p, null); }

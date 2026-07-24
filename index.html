@@ -175,6 +175,10 @@
   .btn.amzbtn:hover{background:#fdf3e0}
   .btn.amzlink{border-color:#bcd8f2;color:var(--blue)}
   .btn.amzlink:hover{background:var(--blue-soft)}
+  .btn.amzprompt{border-color:#c9b6e8;color:var(--purple)}
+  .btn.amzprompt:hover{background:var(--purple-soft)}
+  #promptText{width:100%;height:320px;border:1px solid var(--line);border-radius:8px;padding:9px 10px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;line-height:1.45;resize:vertical;white-space:pre-wrap;overflow-wrap:break-word;overflow-y:auto;overflow-x:hidden;color:var(--ink)}
+  #promptText:focus{outline:2px solid #bcd8f2;border-color:var(--blue)}
   #btnSave.dirty{position:relative}
   #btnSave.dirty::after{content:"";position:absolute;top:2px;right:2px;width:7px;height:7px;border-radius:50%;background:#ffcf6b;box-shadow:0 0 0 2px #12293f}
   .modal select{width:100%;border:1px solid var(--line);border-radius:7px;padding:8px;font-size:14px;background:#fff}
@@ -384,6 +388,18 @@
         <button class="btn" id="btnGhClose">Close</button>
         <button class="btn primary" id="btnGhPrimary" style="display:none">Continue</button>
       </div>
+    </div>
+  </div>
+</div>
+<!-- AI-extension prompt modal -->
+<div class="overlay" id="promptOverlay">
+  <div class="modal" style="width:600px;max-width:94vw">
+    <h3 id="promptTitle">Shipment prompt</h3>
+    <div class="sub" style="margin-bottom:6px">Paste this into your AI browser extension to create the shipment on Amazon. It's built from this shipment's data (no AI needed to generate it) and tells the agent to stop before final submit so you can review.</div>
+    <textarea id="promptText" readonly spellcheck="false"></textarea>
+    <div class="mrow">
+      <button class="btn" id="promptClose">Close</button>
+      <button class="btn primary" id="promptCopy">Copy prompt</button>
     </div>
   </div>
 </div>
