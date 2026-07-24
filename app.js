@@ -74,6 +74,8 @@ const REF_TYPES = {
 const openTracking = new Set();
 /* transient, in-memory only: which bucket ids are collapsed/minimized to free up screen space (not saved) */
 const collapsedBuckets = new Set();
+/* transient: current text in the product search box (left panel filter) */
+let productQuery = "";
 let state = blankPlan();
 function blankPlan(){
   return { planName:"", po:"", shipFrom:"", readyDate:"", notes:"", products:[], buckets:[] };
@@ -198,7 +200,7 @@ function savePlan(asNew){
   state.updatedAt = Date.now();
   st[name] = state;
   saveStore(st);
-  refreshPlanSelect(); render();
+  refreshPlanSelect(); render(); markClean();
   toast('Saved "'+name+'"');
   pushToCloud();
 }
@@ -207,7 +209,7 @@ function openPlan(name){
   if(!st[name]) return;
   state = st[name];
   state.buckets.forEach(b=>{ if(!b.allocations) b.allocations={}; });
-  render(); refreshPlanSelect();
+  render(); markClean(); refreshPlanSelect();
   toast('Opened "'+name+'"');
 }
 function esc(s){ return String(s??"").replace(/[&<>"']/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
@@ -637,6 +639,16 @@ function exportAll(){
 function safeName(s){ return s.replace(/[\\/:*?"<>|]/g,"-"); }
 
 /* ================= render ================= */
+/* dirty indicator: has the plan changed since it was last saved/opened this session? */
+function planSnapshot(){ return JSON.stringify({planName:state.planName, po:state.po, shipFrom:state.shipFrom, readyDate:state.readyDate, notes:state.notes, products:state.products, buckets:state.buckets}); }
+let lastSavedSnapshot = "";
+function markClean(){ lastSavedSnapshot = planSnapshot(); updateSaveIndicator(); }
+function updateSaveIndicator(){
+  const b = $("#btnSave"); if(!b) return;
+  const dirty = planSnapshot() !== lastSavedSnapshot;
+  b.classList.toggle("dirty", dirty);
+  b.title = dirty ? "You have unsaved changes — click to save" : "Plan saved";
+}
 function render(){
   // plan bar
   $("#fPlanName").value = state.planName||"";
@@ -648,32 +660,53 @@ function render(){
   renderProducts();
   renderBuckets();
   renderSummary();
+  updateSaveIndicator();
 }
 function renderProducts(){
   const box = $("#prodList");
+  const search = $("#prodSearch");
+  if(search) search.style.display = state.products.length ? "" : "none";
   if(!state.products.length){
     box.innerHTML = '<div class="hint" style="padding:6px 2px">No products yet. Import a packing list above or add manually below.</div>';
     $("#unassignedInfo").textContent = "";
     return;
   }
+  // totals always cover ALL products; the list below may be narrowed by the search box
   let totLeft=0, totCartons=0;
-  box.innerHTML = state.products.map(p=>{
-    const left = remaining(p);
-    totLeft+=left; totCartons+=p.cartons.length;
-    const kg = p.cartons.reduce((s,c)=>s+(c.kg||0),0);
-    const cbm = p.cartons.reduce((s,c)=>s+cbmOf(c.dim),0);
-    const units = p.cartons.reduce((s,c)=>s+(c.qty||0),0);
-    return `<div class="prod ${left===0?"done":""}" draggable="true" data-pid="${p.id}">
-      <button class="del" title="Remove product" data-delprod="${p.id}">✕</button>
-      <div class="code">${esc(p.code)}</div>
-      <div class="name">${esc(p.name)}</div>
-      <div class="meta"><span><b>${p.cartons.length}</b> ctns</span><span><b>${fmt(units,0)}</b> units</span><span><b>${fmt(dispKg(kg),0)}</b> ${weightUnitLabel()}</span><span><b>${fmt(dispCbm(cbm),2)}</b> ${volUnitLabel()}</span></div>
-      <div class="row2">
-        <span class="badge ${left===0?"zero":"left"}">${left===0?"fully assigned":left+" ctns unassigned"}</span>
-        <label class="hint" title="Must arrive by">need by <input type="date" data-deadline="${p.id}" value="${p.deadline||""}"></label>
-      </div>
-    </div>`;
-  }).join("");
+  state.products.forEach(p=>{ totLeft+=remaining(p); totCartons+=p.cartons.length; });
+  const q = (productQuery||"").trim().toLowerCase();
+  const shown = q ? state.products.filter(p=>((p.code||"")+" "+(p.name||"")).toLowerCase().includes(q)) : state.products;
+  if(!shown.length){
+    box.innerHTML = '<div class="hint" style="padding:6px 2px">No products match "'+esc(q)+'".</div>';
+  } else {
+    const unit = isImperial()?"in":"cm";
+    box.innerHTML = shown.map(p=>{
+      const left = remaining(p);
+      const kg = p.cartons.reduce((s,c)=>s+(c.kg||0),0);
+      const cbm = p.cartons.reduce((s,c)=>s+cbmOf(c.dim),0);
+      const units = p.cartons.reduce((s,c)=>s+(c.qty||0),0);
+      const dims = p.cartons.map(c=>c.dim).filter(Boolean);
+      const uniform = dims.length>0 && dims.every(d=>d===dims[0]);
+      return `<div class="prod ${left===0?"done":""}" draggable="true" data-pid="${p.id}">
+        <button class="del" title="Remove product" data-delprod="${p.id}">✕</button>
+        <div class="code">${esc(p.code)}</div>
+        <div class="name">${esc(p.name)}</div>
+        <div class="meta"><span><b>${p.cartons.length}</b> ctns</span><span><b>${fmt(units,0)}</b> units</span><span><b>${fmt(dispKg(kg),0)}</b> ${weightUnitLabel()}</span><span><b>${fmt(dispCbm(cbm),2)}</b> ${volUnitLabel()}</span></div>
+        <div class="pdimrow">
+          <label>case dims (${unit})</label>
+          <input data-pdim="${p.id}" value="${escAttr(dispDimStr(dims[0]||""))}" placeholder="LxWxH" title="Carton/case dimensions — sets the size for all ${p.cartons.length} cartons of this product">
+          ${dims.length && !uniform ? '<span class="hint" title="Cartons currently have different sizes; editing sets them all the same">mixed</span>' : ''}
+        </div>
+        <div class="row2">
+          <span class="badge ${left===0?"zero":"left"}">${left===0?"fully assigned":left+" ctns unassigned"}</span>
+          <label class="hint" title="Must arrive by">need by <input type="date" data-deadline="${p.id}" value="${p.deadline||""}"></label>
+        </div>
+        <div class="prow-actions">
+          <button class="btn assign" data-assign="${p.id}">Assign →</button>
+        </div>
+      </div>`;
+    }).join("");
+  }
   $("#unassignedInfo").textContent = totLeft>0 ? totLeft+" of "+totCartons+" cartons unassigned" : "all "+totCartons+" cartons assigned";
 }
 function updateCollapseAllLabel(){
@@ -733,7 +766,8 @@ function renderBuckets(){
         <div class="field"><label>Transit days (door to door)</label><input type="number" data-btransit="${b.id}" value="${escAttr(b.transit||"")}" placeholder="e.g. 38"></div>
       </div>
       <div class="alloc">
-        ${allocRows ? `<table><thead><tr><th>Product</th><th class="num">Ctns</th><th class="num">Units</th><th class="num">${weightUnitLabel().toUpperCase()}</th><th class="num">${volUnitLabel()}</th><th></th></tr></thead><tbody>${allocRows}</tbody></table>` : `<div class="dropzone-empty">Drop products here</div>`}
+        ${allocRows ? `<table><thead><tr><th>Product</th><th class="num">Ctns</th><th class="num">Units</th><th class="num">${weightUnitLabel().toUpperCase()}</th><th class="num">${volUnitLabel()}</th><th></th></tr></thead><tbody>${allocRows}</tbody></table>` : `<div class="dropzone-empty">Drag a product here, or add a new one below</div>`}
+        <div style="padding:6px 0 2px"><button class="btn small" data-addprodto="${b.id}">+ New product to this shipment</button></div>
       </div>
       <details class="tracking" data-trackid="${b.id}" ${openTracking.has(b.id)?"open":""}>
         <summary>Tracking and status</summary>
@@ -772,7 +806,7 @@ function renderBuckets(){
         </div>
         <div class="eta">ETA: <b>${eta?dstr(eta):"set ready date + transit"}</b>${eta&&!late.length?' <span class="ok">on time for all deadlines set</span>':""}</div>
         ${late.length?`<div class="warnflag">⚠ Arrives after need-by date: ${late.map(p=>esc(p.code)).join(", ")}. Consider moving those cartons to a faster shipment.</div>`:""}
-        <div class="bucket-actions"><button class="btn small" data-savebucket="${b.id}" title="Save the whole plan now so this shipment's changes aren't lost">Save</button><button class="btn small" data-export="${b.id}">Export packing list</button></div>
+        <div class="bucket-actions"><button class="btn small" data-savebucket="${b.id}" title="Save the whole plan now so this shipment's changes aren't lost">Save</button><button class="btn small" data-dupbucket="${b.id}" title="Create a copy with the same settings and no cartons">Duplicate</button><button class="btn small" data-export="${b.id}">Export packing list</button></div>
       </div>
       `}
     </div>`;
@@ -829,7 +863,7 @@ function renderSummary(){
 // header buttons
 $("#btnSave").onclick = ()=>savePlan(false);
 $("#btnSaveAs").onclick = ()=>savePlan(true);
-$("#btnNew").onclick = ()=>{ if(confirm("Start a new empty plan? Unsaved changes are lost.")){ state=blankPlan(); render(); refreshPlanSelect(); } };
+$("#btnNew").onclick = ()=>{ if(confirm("Start a new empty plan? Unsaved changes are lost.")){ state=blankPlan(); productQuery=""; if($("#prodSearch")) $("#prodSearch").value=""; render(); markClean(); refreshPlanSelect(); } };
 $("#btnDeletePlan").onclick = ()=>{
   const name = $("#planSelect").value || state.planName;
   if(!name){ toast("No saved plan selected"); return; }
@@ -854,7 +888,7 @@ $("#jsonFile").onchange = e=>{
       Object.assign(st, data.saved||{});
       saveStore(st);
       if(data.current){ state = data.current; }
-      render(); refreshPlanSelect(); toast("Backup restored");
+      render(); markClean(); refreshPlanSelect(); toast("Backup restored");
     }catch(err){ toast("Not a valid backup file"); }
   };
   r.readAsText(f); e.target.value="";
@@ -877,22 +911,54 @@ document.addEventListener("drop", e=>{
 });
 // display-unit toggle (kg/cm vs lb/in) -- storage stays metric; this only changes what's rendered
 $("#fUnits").addEventListener("change", e=>{ setUnits(e.target.value); render(); });
-// add manual product
+// left-panel product search filter
+$("#prodSearch").addEventListener("input", e=>{ productQuery = e.target.value; renderProducts(); });
+/* Build a product from raw form values, converting weight/dims to the metric canonical storage.
+   Returns null if code or carton count is missing. Shared by the manual add form and the
+   per-shipment "New product" modal. */
+function buildProduct(code, name, n, qty, kg, kgUnit, dim, dimUnit){
+  n = Math.floor(n);
+  if(!code || !n || n<1) return null;
+  if(kgUnit==="lb") kg = kg/KG2LB;
+  if(dimUnit==="in"){ const d = parseDim(dim); if(d) dim = d.map(x=>+(x*IN2CM).toFixed(2)).join("x"); }
+  const cartons=[]; for(let i=1;i<=n;i++) cartons.push({n:i, qty:qty||0, dim:dim||"", kg:kg||0, note:""});
+  return {id:uid(), code, name:name||code, deadline:"", cartons};
+}
+// add manual product (left panel)
 $("#btnAddProd").onclick = ()=>{
-  const code=$("#apCode").value.trim(), name=$("#apName").value.trim();
-  const n=+$("#apCartons").value, qty=+$("#apQty").value;
-  let kg=+$("#apKg").value, dim=$("#apDim").value.trim();
-  // the form lets the user enter weight/dims in kg or lb, cm or in; always convert down to the metric canonical storage
-  if($("#apKgUnit").value==="lb") kg = kg/KG2LB;
-  if($("#apDimUnit").value==="in"){
-    const d = parseDim(dim);
-    if(d) dim = d.map(x=>+(x*IN2CM).toFixed(2)).join("x");
-  }
-  if(!code||!n){ toast("Need at least a code and carton count"); return; }
-  const cartons=[]; for(let i=1;i<=n;i++) cartons.push({n:i, qty, dim, kg, note:""});
-  state.products.push({id:uid(), code, name:name||code, deadline:"", cartons});
+  const prod = buildProduct($("#apCode").value.trim(), $("#apName").value.trim(), +$("#apCartons").value, +$("#apQty").value, +$("#apKg").value, $("#apKgUnit").value, $("#apDim").value.trim(), $("#apDimUnit").value);
+  if(!prod){ toast("Need at least a code and carton count"); return; }
+  state.products.push(prod);
   render();
 };
+/* Add a brand-new product straight onto a shipment: it lands in the main product list AND is
+   fully allocated to that shipment. */
+let npCtx = null; // bucket id we're adding a product to
+function openAddProductModal(bucketId){
+  const b = bucketOf(bucketId); if(!b) return;
+  npCtx = bucketId;
+  $("#npTitle").textContent = "Add a product to " + (b.label||MODES[b.mode]);
+  $("#npSub").textContent = "Creates the product in your main list and assigns all its cartons to this shipment.";
+  $("#npCode").value=""; $("#npName").value=""; $("#npCartons").value="10"; $("#npQty").value="100";
+  $("#npKg").value="6"; $("#npKgUnit").value = isImperial()?"lb":"kg";
+  $("#npDim").value=""; $("#npDimUnit").value = isImperial()?"in":"cm";
+  $("#npOverlay").classList.add("show");
+  setTimeout(()=>{ $("#npCode").focus(); }, 50);
+}
+$("#npCancel").onclick = ()=>{ $("#npOverlay").classList.remove("show"); npCtx=null; };
+$("#npOk").onclick = ()=>{
+  const b = bucketOf(npCtx);
+  if(!b){ $("#npOverlay").classList.remove("show"); npCtx=null; return; }
+  const prod = buildProduct($("#npCode").value.trim(), $("#npName").value.trim(), +$("#npCartons").value, +$("#npQty").value, +$("#npKg").value, $("#npKgUnit").value, $("#npDim").value.trim(), $("#npDimUnit").value);
+  if(!prod){ toast("Need at least a code and carton count"); return; }
+  state.products.push(prod);
+  b.allocations[prod.id] = prod.cartons.length; // all cartons go to this shipment
+  $("#npOverlay").classList.remove("show"); npCtx=null;
+  render();
+  toast('Added '+prod.code+' to '+(b.label||MODES[b.mode]));
+};
+$("#npOverlay").addEventListener("click", e=>{ if(e.target && e.target.id==="npOverlay"){ $("#npOverlay").classList.remove("show"); npCtx=null; } });
+$("#npOverlay").addEventListener("keydown", e=>{ if(e.key==="Escape") $("#npCancel").click(); });
 // add bucket
 $("#btnAddBucket").onclick = ()=>{
   state.buckets.push({id:uid(), label:"Shipment "+(state.buckets.length+1), mode:"ocean-west", destType:"fba-split", shipTo:"", quote:"", transit:"", allocations:{},
@@ -1165,6 +1231,7 @@ document.addEventListener("input", e=>{
     clearTimeout(window._allocT);
     window._allocT = setTimeout(()=>{ render(); }, 700);
   }
+  updateSaveIndicator();
 });
 document.addEventListener("change", e=>{
   const t = e.target;
@@ -1180,6 +1247,17 @@ document.addEventListener("change", e=>{
     if(b && b.refs && b.refs[+idx]){ b.refs[+idx].type=t.value; renderBuckets(); }
   }
   if(t.dataset.refval){ renderBuckets(); } // value already applied on input; re-render to show/hide the "open" link
+  if(t.dataset.pdim){
+    const p = state.products.find(x=>x.id===t.dataset.pdim);
+    if(p){
+      let dim = t.value.trim();
+      // display may be in inches; store the canonical cm value on every carton of this product
+      if(dim && isImperial()){ const d = parseDim(dim); if(d) dim = d.map(x=>+(x*IN2CM).toFixed(2)).join("x"); }
+      p.cartons.forEach(c=>c.dim=dim);
+      render();
+    }
+  }
+  updateSaveIndicator();
 });
 document.addEventListener("click", e=>{
   const t = e.target;
@@ -1189,6 +1267,19 @@ document.addEventListener("click", e=>{
   if(t.dataset.export){ exportBucket(bucketOf(t.dataset.export)); }
   if(t.dataset.collapse){ const id=t.dataset.collapse; if(collapsedBuckets.has(id)) collapsedBuckets.delete(id); else collapsedBuckets.add(id); renderBuckets(); }
   if(t.dataset.savebucket){ savePlan(false); }
+  if(t.dataset.assign){ const p=state.products.find(x=>x.id===t.dataset.assign); if(p) openCountModal(p, null); }
+  if(t.dataset.addprodto){ openAddProductModal(t.dataset.addprodto); }
+  if(t.dataset.dupbucket){
+    const b = bucketOf(t.dataset.dupbucket);
+    if(b){
+      const copy = {id:uid(), label:(b.label||MODES[b.mode])+" (copy)", mode:b.mode, destType:b.destType, shipTo:b.shipTo, quote:b.quote, transit:b.transit, allocations:{},
+        status:"planned", carrier:"", refs:[], depDate:"", arrDate:""};
+      const idx = state.buckets.findIndex(x=>x.id===b.id);
+      state.buckets.splice(idx+1, 0, copy);
+      render();
+      toast("Shipment duplicated — settings copied, cartons empty");
+    }
+  }
   if(t.dataset.addref){
     const b = bucketOf(t.dataset.addref);
     if(b){ if(!b.refs) b.refs=[]; b.refs.push({type:"tracking", value:""}); openTracking.add(b.id); renderBuckets(); }
@@ -1236,27 +1327,52 @@ document.addEventListener("drop", e=>{
   openCountModal(p, b);
 });
 
-/* count modal */
+/* count modal. b may be a bucket (from drag/drop) or null (from a product's "Assign →" button,
+   in which case a shipment picker is shown so the user can choose the target). */
 let modalCtx = null;
+function bucketMaxAvail(p, b){ return remaining(p) + (b.allocations[p.id]||0); }
 function openCountModal(p, b){
-  modalCtx = {p, b};
-  const left = remaining(p) + (b.allocations[p.id]||0);
-  $("#mTitle").textContent = p.code + " → " + (b.label||MODES[b.mode]);
-  $("#mCount").value = left;
-  $("#mCount").max = left;
-  $("#mSub").textContent = p.cartons.length+" cartons total, "+left+" available for this shipment. Units per carton: "+(p.cartons[0]?p.cartons[0].qty:"?");
+  if(!b && !state.buckets.length){ toast("Add a shipment first, then assign."); return; }
+  modalCtx = {p, b: b||null};
+  const picker = $("#mBucketRow"), sel = $("#mBucket");
+  if(b){
+    picker.style.display = "none";
+    $("#mTitle").textContent = p.code + " → " + (b.label||MODES[b.mode]);
+  } else {
+    picker.style.display = "";
+    sel.innerHTML = state.buckets.map(bk=>`<option value="${bk.id}">${esc(bk.label||MODES[bk.mode])}</option>`).join("");
+    const target = state.buckets.find(bk=>bucketMaxAvail(p,bk)>0) || state.buckets[0];
+    sel.value = target.id;
+    $("#mTitle").textContent = "Assign " + p.code;
+  }
+  syncCountModal();
   $("#overlay").classList.add("show");
   setTimeout(()=>{$("#mCount").focus();$("#mCount").select();},50);
 }
+/* recompute the available count + hint for whichever bucket is currently targeted */
+function syncCountModal(){
+  if(!modalCtx) return;
+  const p = modalCtx.p;
+  const b = modalCtx.b || bucketOf($("#mBucket").value);
+  if(!b) return;
+  const left = bucketMaxAvail(p, b);
+  $("#mCount").value = left;
+  $("#mCount").max = left;
+  $("#mSub").textContent = p.cartons.length+" cartons total, "+left+" available for "+(b.label||MODES[b.mode])+". Units per carton: "+(p.cartons[0]?p.cartons[0].qty:"?");
+}
+$("#mBucket").addEventListener("change", syncCountModal);
 $("#mOk").onclick = ()=>{
   if(!modalCtx) return;
-  const {p,b} = modalCtx;
-  const maxA = remaining(p) + (b.allocations[p.id]||0);
+  const p = modalCtx.p;
+  const b = modalCtx.b || bucketOf($("#mBucket").value);
+  if(!b){ $("#overlay").classList.remove("show"); modalCtx=null; return; }
+  const maxA = bucketMaxAvail(p, b);
   let v = Math.max(0, Math.min(maxA, Math.floor(+$("#mCount").value||0)));
   if(v>0) b.allocations[p.id]=v; else delete b.allocations[p.id];
   $("#overlay").classList.remove("show"); modalCtx=null; render();
 };
 $("#mCancel").onclick = ()=>{ $("#overlay").classList.remove("show"); modalCtx=null; };
+$("#overlay").addEventListener("click", e=>{ if(e.target && e.target.id==="overlay"){ $("#overlay").classList.remove("show"); modalCtx=null; } });
 $("#mCount").addEventListener("keydown", e=>{ if(e.key==="Enter") $("#mOk").click(); if(e.key==="Escape") $("#mCancel").click(); });
 
 /* autosave current work-in-progress every 20s so a closed tab loses nothing */
@@ -1268,6 +1384,7 @@ window.addEventListener("load", ()=>{
     if(wip){ const s=JSON.parse(wip); if(s && (s.products.length||s.buckets.length||s.planName)){ state=s; } }
   }catch(e){}
   render();
+  markClean(); // baseline for the unsaved-changes indicator: the state we loaded with
   // background cloud sync: never blocks first render, which already happened from localStorage above
   initCloudUI();
 });

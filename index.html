@@ -148,6 +148,18 @@
   #prodPanel .panel-b{display:flex;flex-direction:column;overflow:hidden;flex:1}
   #prodList{overflow-y:auto;flex:1;min-height:100px;scrollbar-width:thin;padding-right:2px}
   details.addbox{margin:0 0 10px}
+  .prodsearch{width:100%;border:1px solid var(--line);border-radius:7px;padding:6px 9px;margin:0 0 9px;font-size:13px}
+  .prodsearch:focus{outline:2px solid #bcd8f2;border-color:var(--blue)}
+  .prod .prow-actions{display:flex;gap:6px;margin-top:6px}
+  .prod .pdimrow{margin-top:6px;display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+  .prod .pdimrow label{font-size:11px;color:var(--muted)}
+  .prod .pdimrow input{border:1px solid var(--line);border-radius:6px;padding:2px 6px;font-size:11px;width:118px}
+  .btn.assign{padding:3px 8px;font-size:12px;border-color:#bcd8f2;color:var(--blue)}
+  .btn.assign:hover{background:var(--blue-soft)}
+  #btnSave.dirty{position:relative}
+  #btnSave.dirty::after{content:"";position:absolute;top:2px;right:2px;width:7px;height:7px;border-radius:50%;background:#ffcf6b;box-shadow:0 0 0 2px #12293f}
+  .modal select{width:100%;border:1px solid var(--line);border-radius:7px;padding:8px;font-size:14px;background:#fff}
+  .modal .field label{font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:3px;display:block}
   @media(max-width:960px){#prodPanel{position:static;max-height:none}#prodList{max-height:45vh}}
 </style>
 </head>
@@ -211,6 +223,7 @@
             <div class="wide"><button class="btn primary small" id="btnAddProd">Add product</button></div>
           </div>
         </details>
+<input id="prodSearch" class="prodsearch" type="search" placeholder="Search products by code or name…" style="display:none">
 <div id="prodList"></div>
       </div>
     </div>
@@ -243,11 +256,44 @@
 <div class="overlay" id="overlay">
   <div class="modal">
     <h3 id="mTitle">How many cartons?</h3>
+    <div class="field" id="mBucketRow" style="display:none;margin-bottom:10px">
+      <label>Shipment</label>
+      <select id="mBucket"></select>
+    </div>
     <input type="number" id="mCount" min="1">
     <div class="sub" id="mSub"></div>
     <div class="mrow">
       <button class="btn" id="mCancel">Cancel</button>
       <button class="btn primary" id="mOk">Assign</button>
+    </div>
+  </div>
+</div>
+<!-- add-new-product-to-shipment modal -->
+<div class="overlay" id="npOverlay">
+  <div class="modal" style="width:360px">
+    <h3 id="npTitle">Add a product to this shipment</h3>
+    <div class="sub" id="npSub" style="margin-bottom:6px"></div>
+    <div class="addprod">
+      <div class="field"><label>Code</label><input id="npCode" placeholder="PL-XXXX-0000"></div>
+      <div class="field"><label>Name</label><input id="npName" placeholder="Product name"></div>
+      <div class="field"><label>Cartons</label><input id="npCartons" type="number" min="1" value="10"></div>
+      <div class="field"><label>Units per carton</label><input id="npQty" type="number" min="1" value="100"></div>
+      <div class="field"><label>Weight per carton</label>
+        <div style="display:flex;gap:4px">
+          <input id="npKg" type="number" step="0.1" value="6" style="flex:1;min-width:0">
+          <select id="npKgUnit" style="width:62px"><option value="kg">kg</option><option value="lb">lb</option></select>
+        </div>
+      </div>
+      <div class="field"><label>Dims (LxWxH)</label>
+        <div style="display:flex;gap:4px">
+          <input id="npDim" placeholder="34.5x28.5x25" style="flex:1;min-width:0">
+          <select id="npDimUnit" style="width:62px"><option value="cm">cm</option><option value="in">in</option></select>
+        </div>
+      </div>
+    </div>
+    <div class="mrow">
+      <button class="btn" id="npCancel">Cancel</button>
+      <button class="btn primary" id="npOk">Add to shipment</button>
     </div>
   </div>
 </div>
