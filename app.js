@@ -784,7 +784,7 @@ function buildShipmentPrompt(b){
   p.push(`2. Begin a new ${isAWD?"AWD inbound":"Send to Amazon"} workflow.`);
   p.push(`3. Add each Merchant SKU as a case-packed / boxed item using its exact units per box and number of boxes.`);
   p.push(`4. If a SKU already has a saved case/box template for that units-per-box quantity, select and reuse the existing template — do NOT create a new one or edit its dimensions. Only when no matching template exists, enter the box dimensions (inches) and weight (pounds) as listed above.`);
-  p.push(`5. Set prep owner = Seller and labeling owner = Seller.`);
+  p.push(`5. Set prep owner = Seller and labeling owner = Seller. No Amazon barcode labels should be needed — the products use the manufacturer barcode. If any SKU requires Amazon (FNSKU) barcode labeling, stop and flag it instead of proceeding.`);
   p.push(`6. STOP at the final review screen — do NOT submit or confirm. Summarize what you entered, and flag any Merchant SKU not found in my catalog, so I can verify before submitting myself.`);
   return p.join("\n");
 }
