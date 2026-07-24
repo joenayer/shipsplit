@@ -26,15 +26,26 @@ function dispDimStr(dimStr){
   return d.map(x=>fmt(x*CM2IN,1)).join("x");
 }
 function toast(msg){ const t=$("#toast"); t.classList.remove("undo"); t.textContent=msg; t.classList.add("show"); clearTimeout(t._h); t._h=setTimeout(()=>t.classList.remove("show"),2600); }
-/* toast with an Undo action (used instead of confirm() dialogs for deletes) */
-function showUndo(msg, restoreFn){
+/* toast with an Undo action (used instead of confirm() dialogs for deletes).
+   Pending undos are a STACK: deleting twice in a row must not silently discard the first
+   deletion's restore. Undo pops one at a time and re-offers the next. */
+const undoStack = [];
+function renderUndoToast(){
   const t=$("#toast"); clearTimeout(t._h);
-  t.innerHTML = esc(msg)+' <button class="undobtn" id="undoBtn">Undo</button>';
+  if(!undoStack.length){ t.classList.remove("show","undo"); return; }
+  const top = undoStack[undoStack.length-1];
+  const more = undoStack.length>1 ? ' <span class="undomore">+'+(undoStack.length-1)+' more</span>' : '';
+  t.innerHTML = esc(top.msg)+more+' <button class="undobtn" id="undoBtn">Undo</button>';
   t.classList.add("show","undo");
-  const hide=()=>{ t.classList.remove("show","undo"); };
-  const btn=$("#undoBtn"); if(btn) btn.onclick=()=>{ try{ restoreFn(); }catch(e){} hide(); toast("Restored"); };
-  t._h=setTimeout(hide, 6000);
+  const btn=$("#undoBtn");
+  if(btn) btn.onclick=()=>{
+    const entry = undoStack.pop();
+    if(entry){ try{ entry.fn(); }catch(e){} }
+    if(undoStack.length) renderUndoToast(); else { t.classList.remove("show","undo"); toast("Restored"); }
+  };
+  t._h=setTimeout(()=>{ undoStack.length=0; t.classList.remove("show","undo"); }, 6000);
 }
+function showUndo(msg, restoreFn){ undoStack.push({msg, fn:restoreFn}); renderUndoToast(); }
 function parseDim(s){
   if(!s) return null;
   const m = String(s).match(/(\d+(?:\.\d+)?)\s*[xX*×]\s*(\d+(?:\.\d+)?)\s*[xX*×]\s*(\d+(?:\.\d+)?)/);
@@ -89,6 +100,20 @@ let state = blankPlan();
 function blankPlan(){
   return { planName:"", po:"", shipFrom:"", readyDate:"", notes:"", products:[], buckets:[] };
 }
+/* Normalize a plan coming from ANY source (saved store, WIP autosave, restored backup) so older or
+   partial schemas still render instead of throwing: guard every field the renderers assume exists. */
+function normalizePlan(s){
+  if(!s || typeof s!=="object") return blankPlan();
+  const out = Object.assign(blankPlan(), s);
+  if(!Array.isArray(out.products)) out.products = [];
+  if(!Array.isArray(out.buckets)) out.buckets = [];
+  out.products.forEach(p=>{ if(!Array.isArray(p.cartons)) p.cartons = []; });
+  out.buckets.forEach(b=>{
+    if(!b.allocations || typeof b.allocations!=="object") b.allocations = {};
+    if(!Array.isArray(b.refs)) b.refs = [];
+  });
+  return out;
+}
 /* status is optional on older saved plans; default to "planned" everywhere */
 function bStatus(b){ return (b && b.status) || "planned"; }
 function statusLabel(s){ return (STATUS_META[s]||STATUS_META.planned).label; }
@@ -99,6 +124,20 @@ function statusLabel(s){ return (STATUS_META[s]||STATUS_META.planned).label; }
 
 /* ---- derived ---- */
 function allocatedCount(p){ return state.buckets.reduce((s,b)=>s+(b.allocations[p.id]||0),0); }
+/* Trim any over-allocation of a product across buckets (in bucket order) so the same physical case can
+   never be booked twice. Returns how many cases had to be dropped. */
+function clampAllocations(p){
+  let left = p.cartons.length, cut = 0;
+  state.buckets.forEach(b=>{
+    const v = b.allocations[p.id];
+    if(v==null) return;
+    const keep = Math.max(0, Math.min(v, left));
+    if(keep !== v) cut += v - keep;
+    if(keep>0) b.allocations[p.id] = keep; else delete b.allocations[p.id];
+    left -= keep;
+  });
+  return cut;
+}
 function remaining(p){ return p.cartons.length - allocatedCount(p); }
 /* Assign actual cartons sequentially: buckets in order take slices of the product's carton list */
 function cartonSlices(){
@@ -216,8 +255,7 @@ function savePlan(asNew){
 function openPlan(name){
   const st = loadStore();
   if(!st[name]) return;
-  state = st[name];
-  state.buckets.forEach(b=>{ if(!b.allocations) b.allocations={}; });
+  state = normalizePlan(st[name]);
   render(); markClean(); refreshPlanSelect();
   toast('Opened "'+name+'"');
 }
@@ -305,6 +343,22 @@ async function ghPutPlans(cfg, obj){
 function cloudErrorMessage(err){
   return (err && err.message) ? err.message : "network error";
 }
+/* After a merge, the plan open in the editor may now be stale. Without this, a later Save would write
+   the stale in-memory copy over the newer merged one and push it back up, silently clobbering the edit
+   made on another device. Adopt the newer copy when there are no unsaved edits; warn when there are. */
+function reconcileOpenPlan(store){
+  const name = state.planName;
+  if(!name || !store || !store[name]) return;
+  const incoming = store[name];
+  if((Number(incoming.updatedAt)||0) <= (Number(state.updatedAt)||0)) return;
+  if(planSnapshot() === lastSavedSnapshot){
+    state = normalizePlan(incoming);
+    render(); markClean();
+    toast('Updated "'+name+'" from the cloud');
+  } else {
+    toast('"'+name+'" also changed on another device — use Save as to keep both.');
+  }
+}
 /* Pull cloud plans, merge with local (raw, incl. tombstones), write result locally and (if changed) back to cloud. */
 async function pullAndMerge(opts){
   opts = opts||{};
@@ -318,6 +372,7 @@ async function pullAndMerge(opts){
     const mergedJson = JSON.stringify(merged);
     localStorage.setItem(LS_KEY, mergedJson);
     setCloudState("on");
+    reconcileOpenPlan(merged); // keep the editing session in step with what we just merged in
     if(JSON.stringify(cloudObj) !== mergedJson){
       await ghPutPlans(cfg, merged);
     }
@@ -822,7 +877,36 @@ function render(){
   renderSummary();
   updateSaveIndicator();
 }
+/* Re-rendering a panel replaces its innerHTML, which drops focus — and worse, if the user has already
+   tabbed or clicked into the NEXT field when the previous one commits, that field is destroyed
+   mid-typing and keystrokes are lost. Capture the focused control by its data-* attribute (plus its
+   index, since L/W/H share one attribute) and restore it after the re-render. */
+function cssEsc(v){ return (window.CSS && CSS.escape) ? CSS.escape(v) : String(v).replace(/["\\]/g,"\\$&"); }
+function captureFocus(container){
+  const el = document.activeElement;
+  if(!el || !container || !container.contains(el)) return null;
+  const attr = [].slice.call(el.attributes).find(a=>a.name.indexOf("data-")===0);
+  if(!attr) return null;
+  const sel = "["+attr.name+'="'+cssEsc(attr.value)+'"]';
+  const idx = [].slice.call(document.querySelectorAll(sel)).indexOf(el);
+  let range = null;
+  try{ range = {s:el.selectionStart, e:el.selectionEnd}; }catch(e){}
+  return {sel, idx: idx<0?0:idx, range};
+}
+function restoreFocus(cap){
+  if(!cap) return;
+  const list = document.querySelectorAll(cap.sel);
+  const el = list[cap.idx] || list[0];
+  if(!el) return;
+  el.focus();
+  if(cap.range && cap.range.s!=null){ try{ el.setSelectionRange(cap.range.s, cap.range.e); }catch(e){} }
+}
 function renderProducts(){
+  const cap = captureFocus($("#prodList"));
+  renderProductsInner();
+  restoreFocus(cap);
+}
+function renderProductsInner(){
   const box = $("#prodList");
   const search = $("#prodSearch");
   if(search) search.style.display = state.products.length ? "" : "none";
@@ -849,18 +933,21 @@ function renderProducts(){
       const uniform = dims.length>0 && dims.every(d=>d===dims[0]);
       // per-case editable values (assume uniform; show the first case's numbers)
       const c0 = p.cartons[0]||{};
+      // editing units/case or kg/case overwrites EVERY case, so warn when they currently differ
+      const mixedQty = p.cartons.length>1 && p.cartons.some(c=>(c.qty||0)!==(p.cartons[0].qty||0));
+      const mixedKg  = p.cartons.length>1 && p.cartons.some(c=>(c.kg||0)!==(p.cartons[0].kg||0));
       const qty0 = c0.qty!=null ? c0.qty : "";
       const kg0 = c0.kg!=null ? +(dispKg(c0.kg)).toFixed(2) : "";
       const d0 = parseDim(dims[0]||"");
       const dv = d0 ? (isImperial()? d0.map(x=>String(+(x*CM2IN).toFixed(1))) : d0.map(x=>String(x))) : ["","",""];
       return `<div class="prod ${left===0?"done":""}" draggable="true" data-pid="${p.id}">
-        <button class="del" title="Remove product" data-delprod="${p.id}">✕</button>
+        <button class="del" title="Remove product" aria-label="Remove product" data-delprod="${p.id}">✕</button>
         <input class="pcode" data-pcode="${p.id}" value="${escAttr(p.code)}" title="Product code" spellcheck="false">
         <input class="pname" data-pname="${p.id}" value="${escAttr(p.name)}" placeholder="Product name" title="Product name">
         <div class="meta"><span><b>${p.cartons.length}</b> cases</span><span><b>${fmt(units,0)}</b> units</span><span><b>${fmt(dispKg(kg),0)}</b> ${weightUnitLabel()}</span><span><b>${fmt(dispCbm(cbm),2)}</b> ${volUnitLabel()}</span></div>
         <div class="pedit">
-          <label title="Units in each case">units/case <input type="number" min="0" data-pqty="${p.id}" value="${qty0}"></label>
-          <label title="Weight of each case">${weightUnitLabel()}/case <input type="number" min="0" step="0.1" data-pkg="${p.id}" value="${kg0}"></label>
+          <label title="Units in each case">units/case <input type="number" min="0" data-pqty="${p.id}" value="${escAttr(qty0)}">${mixedQty?'<span class="hint" title="Cases currently hold different quantities; editing sets them all the same">mixed</span>':''}</label>
+          <label title="Weight of each case">${weightUnitLabel()}/case <input type="number" min="0" step="0.1" data-pkg="${p.id}" value="${escAttr(kg0)}">${mixedKg?'<span class="hint" title="Cases currently have different weights; editing sets them all the same">mixed</span>':''}</label>
         </div>
         <div class="pmsku"><label title="Amazon Merchant SKU used on the FBA/AWD upload sheets — leave blank to use the code above">Amazon MSKU <input data-pmsku="${p.id}" value="${escAttr(p.msku||"")}" placeholder="${escAttr(p.code)}" spellcheck="false"></label></div>
         <div class="pdimrow">
@@ -873,8 +960,8 @@ function renderProducts(){
           ${dims.length && !uniform ? '<span class="hint" title="Cases currently have different sizes; editing sets them all the same">mixed</span>' : ''}
         </div>
         <div class="row2">
-          <span class="badge ${left===0?"zero":"left"}">${left===0?"fully assigned":left+" cases unassigned"}</span>
-          <label class="hint" title="Must arrive by">need by <input type="date" data-deadline="${p.id}" value="${p.deadline||""}"></label>
+          <span class="badge ${left===0?"zero":"left"}">${p.cartons.length===0?"no cases":left===0?"fully assigned":left+" cases unassigned"}</span>
+          <label class="hint" title="Must arrive by">need by <input type="date" data-deadline="${p.id}" value="${escAttr(p.deadline||"")}"></label>
         </div>
         <div class="prow-actions">
           <button class="btn assign" data-assign="${p.id}">Assign →</button>
@@ -894,6 +981,11 @@ function updateCollapseAllLabel(){
   btn.textContent = allCollapsed ? "Expand all" : "Collapse all";
 }
 function renderBuckets(){
+  const cap = captureFocus($("#bucketGrid"));
+  renderBucketsInner();
+  restoreFocus(cap);
+}
+function renderBucketsInner(){
   const grid = $("#bucketGrid");
   updateCollapseAllLabel();
   const slices = cartonSlices();
@@ -915,11 +1007,11 @@ function renderBuckets(){
       const isLate = late.some(x=>x.id===pid);
       return `<tr>
         <td ${isLate?'class="late-cell" title="Arrives after need-by date"':''}>${esc(p.code)}${isLate?" ⚠":""}</td>
-        <td class="num"><input type="number" class="cnt" min="0" max="${p.cartons.length}" value="${b.allocations[pid]}" data-alloc="${b.id}|${pid}"></td>
+        <td class="num"><input type="number" class="cnt" min="0" max="${p.cartons.length}" value="${escAttr(b.allocations[pid])}" data-alloc="${b.id}|${pid}"></td>
         <td class="num">${fmt(su,0)}</td>
         <td class="num">${fmt(dispKg(skg),0)}</td>
         <td class="num">${fmt(dispCbm(scbm),2)}</td>
-        <td><button class="rm" title="Remove" data-rmalloc="${b.id}|${pid}">✕</button></td>
+        <td><button class="rm" title="Remove ${escAttr(p.code)} from this shipment" aria-label="Remove ${escAttr(p.code)} from this shipment" data-rmalloc="${b.id}|${pid}">✕</button></td>
       </tr>`;
     }).join("");
     const st = bStatus(b);
@@ -934,7 +1026,7 @@ function renderBuckets(){
         <input class="label" value="${escAttr(b.label||"")}" placeholder="Shipment name" data-blabel="${b.id}">
         <button class="movebtn" data-moveup="${b.id}" title="Move up" aria-label="Move shipment up"${bi===0?' style="visibility:hidden"':''}>▲</button>
         <button class="movebtn" data-movedown="${b.id}" title="Move down" aria-label="Move shipment down"${bi===state.buckets.length-1?' style="visibility:hidden"':''}>▼</button>
-        <button class="rm" title="Delete shipment" data-delbucket="${b.id}" style="border:none;background:none;color:#b9c4d0;cursor:pointer">✕</button>
+        <button class="rm" title="Delete shipment" aria-label="Delete shipment" data-delbucket="${b.id}" style="border:none;background:none;color:#b9c4d0;cursor:pointer">✕</button>
       </div>
       ${collapsed ? `<div class="bucket-collapsed"><span>${t.cartons} cases · ${fmt(t.units,0)} units · ${fmt(dispKg(t.kg),0)} ${weightUnitLabel()} · ${fmt(dispCbm(t.cbm),2)} ${volUnitLabel()}${q?` · ${fmt$(q)}`:""}${eta?` · ETA ${dstr(eta)}`:""}</span>${late.length?`<span class="late-cell">⚠ late</span>`:""}</div>` : `
       <div class="bucket-fields">
@@ -957,8 +1049,8 @@ function renderBuckets(){
             <select class="statuschip ${st}" data-bstatus="${b.id}">${Object.keys(STATUS_META).map(s=>`<option value="${s}" ${s===st?"selected":""}>${STATUS_META[s].label}</option>`).join("")}</select>
           </div>
           <div class="field"><label>Carrier / forwarder</label><input data-bcarrier="${b.id}" value="${escAttr(b.carrier||"")}" placeholder="e.g. Flexport, DHL"></div>
-          <div class="field"><label>Actual departure</label><input type="date" data-bdep="${b.id}" value="${b.depDate||""}"></div>
-          <div class="field"><label>Actual arrival</label><input type="date" data-barr="${b.id}" value="${b.arrDate||""}"></div>
+          <div class="field"><label>Actual departure</label><input type="date" data-bdep="${b.id}" value="${escAttr(b.depDate||"")}"></div>
+          <div class="field"><label>Actual arrival</label><input type="date" data-barr="${b.id}" value="${escAttr(b.arrDate||"")}"></div>
         </div>
         <div class="refs">
           <label style="font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.5px">References</label>
@@ -968,7 +1060,7 @@ function renderBuckets(){
               <select data-reftype="${b.id}|${i}">${Object.keys(REF_TYPES).map(rt=>`<option value="${rt}" ${rt===r.type?"selected":""}>${REF_TYPES[rt]}</option>`).join("")}</select>
               <input data-refval="${b.id}|${i}" value="${escAttr(r.value||"")}" placeholder="value">
               ${showLink?`<a class="reflink" href="${escAttr(r.value)}" target="_blank" rel="noopener">open</a>`:""}
-              <button class="rm" title="Remove reference" data-rmref="${b.id}|${i}">✕</button>
+              <button class="rm" title="Remove reference" aria-label="Remove reference" data-rmref="${b.id}|${i}">✕</button>
             </div>`;
           }).join("")}
           <button class="btn small" data-addref="${b.id}">+ Add reference</button>
@@ -1090,7 +1182,7 @@ $("#jsonFile").onchange = e=>{
       const st = loadStore();
       Object.assign(st, data.saved||{});
       saveStore(st);
-      if(data.current){ state = data.current; }
+      if(data.current){ state = normalizePlan(data.current); }
       render(); markClean(); refreshPlanSelect(); toast("Backup restored");
     }catch(err){ toast("Not a valid backup file"); }
   };
@@ -1112,8 +1204,15 @@ document.addEventListener("drop", e=>{
     [...e.dataTransfer.files].forEach(f=>importXlsx(f));
   }
 });
+/* keep the manual "Add a product" form's unit selectors in step with the display-units toggle, so a
+   user reading lb/in everywhere doesn't type pounds into a field silently still set to kg */
+function syncAddFormUnits(){
+  const k=$("#apKgUnit"), d=$("#apDimUnit");
+  if(k) k.value = isImperial()?"lb":"kg";
+  if(d) d.value = isImperial()?"in":"cm";
+}
 // display-unit toggle (kg/cm vs lb/in) -- storage stays metric; this only changes what's rendered
-$("#fUnits").addEventListener("change", e=>{ setUnits(e.target.value); render(); });
+$("#fUnits").addEventListener("change", e=>{ setUnits(e.target.value); syncAddFormUnits(); render(); });
 // left-panel product search filter
 $("#prodSearch").addEventListener("input", e=>{ productQuery = e.target.value; renderProducts(); });
 /* Build a product from raw form values, converting weight/dims to the metric canonical storage.
@@ -1440,8 +1539,11 @@ document.addEventListener("input", e=>{
   if(t.dataset.deadline){ const p=state.products.find(x=>x.id===t.dataset.deadline); if(p){p.deadline=t.value; renderBuckets(); renderSummary();} }
   if(t.dataset.blabel){ bucketOf(t.dataset.blabel).label=t.value; renderSummary(); }
   if(t.dataset.bshipto){ bucketOf(t.dataset.bshipto).shipTo=t.value; renderSummary(); }
-  if(t.dataset.bquote){ bucketOf(t.dataset.bquote).quote=t.value; refreshTotalsOnly(); }
-  if(t.dataset.btransit){ bucketOf(t.dataset.btransit).transit=t.value; refreshTotalsOnly(); }
+  /* quote/transit: update state only while typing. Re-rendering here would rebuild #bucketGrid's
+     innerHTML and destroy the very input being typed into (every keystroke after the first was
+     lost). Dependent totals refresh on "change" (blur/commit) below. */
+  if(t.dataset.bquote){ const bq=bucketOf(t.dataset.bquote); if(bq) bq.quote=t.value; }
+  if(t.dataset.btransit){ const bt=bucketOf(t.dataset.btransit); if(bt) bt.transit=t.value; }
   /* text fields inside the tracking <details>: just update state on every keystroke, no re-render (would collapse the details / steal focus); a full re-render happens on "change" (blur/commit) below */
   if(t.dataset.bcarrier){ const b=bucketOf(t.dataset.bcarrier); if(b) b.carrier=t.value; }
   if(t.dataset.bdep){ const b=bucketOf(t.dataset.bdep); if(b) b.depDate=t.value; }
@@ -1473,6 +1575,11 @@ document.addEventListener("change", e=>{
   const t = e.target;
   if(t.dataset.bmode){ bucketOf(t.dataset.bmode).mode=t.value; render(); }
   if(t.dataset.bdest){ bucketOf(t.dataset.bdest).destType=t.value; renderBuckets(); renderSummary(); } // renderBuckets so the AWD/FBA export buttons re-evaluate
+  /* value already applied on input; refresh the derived totals once committed. Deferred a tick so the
+     browser finishes moving focus to whatever the user tabbed/clicked into BEFORE we replace the
+     grid's innerHTML — otherwise that next field is destroyed under them mid-typing. */
+  if(t.dataset.bquote){ const bq=bucketOf(t.dataset.bquote); if(bq) bq.quote=t.value; setTimeout(refreshTotalsSafely,0); }
+  if(t.dataset.btransit){ const bt=bucketOf(t.dataset.btransit); if(bt) bt.transit=t.value; setTimeout(refreshTotalsSafely,0); }
   if(t.dataset.bstatus){ const b=bucketOf(t.dataset.bstatus); if(b){ b.status=t.value; renderBuckets(); renderSummary(); } }
   if(t.dataset.bcarrier){ /* value already applied on input; nothing else depends on it visually */ }
   if(t.dataset.bdep){ const b=bucketOf(t.dataset.bdep); if(b){ b.depDate=t.value; renderBuckets(); renderSummary(); } }
@@ -1490,7 +1597,16 @@ document.addEventListener("change", e=>{
   }
   if(t.dataset.pkg){
     const p = state.products.find(x=>x.id===t.dataset.pkg);
-    if(p){ let kg=Math.max(0,+t.value||0); if(isImperial()) kg=kg/KG2LB; p.cartons.forEach(c=>c.kg=kg); render(); }
+    if(p){
+      /* the field only holds the DISPLAY-rounded number, so converting it back on an incidental blur
+         would nudge the canonical metric value (6kg -> 13.23lb -> 6.0010kg). Only write when the user
+         actually changed the shown number. */
+      const shown = p.cartons[0] ? String(+(dispKg(p.cartons[0].kg)).toFixed(2)) : "";
+      if(String(t.value).trim() !== shown){
+        let kg=Math.max(0,+t.value||0); if(isImperial()) kg=kg/KG2LB;
+        p.cartons.forEach(c=>c.kg=kg); render();
+      }
+    }
   }
   if(t.dataset.pdim){
     const p = state.products.find(x=>x.id===t.dataset.pdim);
@@ -1499,6 +1615,11 @@ document.addEventListener("change", e=>{
       const row = t.closest(".pdimrow");
       const inputs = row ? [...row.querySelectorAll("input[data-pdim]")] : [t];
       const nums = inputs.map(inp=>inp.value.trim());
+      /* same rounding-drift guard as the weight field: if the three boxes still show exactly what we
+         rendered, the user only tabbed through — don't convert the rounded display back into storage */
+      const cur = parseDim((p.cartons[0]||{}).dim||"");
+      const shown = cur ? (isImperial()? cur.map(x=>String(+(x*CM2IN).toFixed(1))) : cur.map(x=>String(x))) : ["","",""];
+      if(nums.length===shown.length && nums.every((v,i)=>v===shown[i])) return;
       let dim = "";
       if(nums.some(v=>v!=="")){
         let vals = nums.map(v=>{ const n=parseFloat(v); return isNaN(n)?0:n; });
@@ -1520,7 +1641,13 @@ document.addEventListener("click", e=>{
       const removed=state.products[idx];
       const allocs=state.buckets.filter(b=>b.allocations[pid]!=null).map(b=>({b, n:b.allocations[pid]}));
       state.products.splice(idx,1); state.buckets.forEach(b=>delete b.allocations[pid]); render();
-      showUndo('Removed '+(removed.code||"product"), ()=>{ state.products.splice(Math.min(idx,state.products.length),0,removed); allocs.forEach(x=>{ x.b.allocations[pid]=x.n; }); render(); });
+      showUndo('Removed '+(removed.code||"product"), ()=>{
+        state.products.splice(Math.min(idx,state.products.length),0,removed);
+        allocs.forEach(x=>{ x.b.allocations[pid]=x.n; });
+        const cut = clampAllocations(removed); // capacity may have been reused while the toast was up
+        render();
+        if(cut) toast("Restored, but "+cut+" case"+(cut===1?"":"s")+" no longer fit and were dropped");
+      });
     }
   }
   if(t.dataset.delbucket){
@@ -1535,7 +1662,16 @@ document.addEventListener("click", e=>{
     const [bid,pid]=t.dataset.rmalloc.split("|"); const b=bucketOf(bid);
     if(b){ const prev=b.allocations[pid]; delete b.allocations[pid]; render();
       const p=state.products.find(x=>x.id===pid);
-      showUndo('Removed '+((p&&p.code)||"product")+' from '+(b.label||MODES[b.mode]), ()=>{ b.allocations[pid]=prev; render(); }); }
+      showUndo('Removed '+((p&&p.code)||"product")+' from '+(b.label||MODES[b.mode]), ()=>{
+        /* the freed cases may have been assigned elsewhere while the toast was up — restore only what
+           is still available, otherwise the same physical cartons get booked into two shipments */
+        const avail = p ? remaining(p) : prev;
+        const v = Math.max(0, Math.min(prev, avail));
+        if(v>0) b.allocations[pid]=v; else delete b.allocations[pid];
+        render();
+        if(v<prev) toast(v>0 ? "Restored "+v+" of "+prev+" cases — the rest were reassigned meanwhile"
+                            : "Could not restore: those cases are now assigned elsewhere");
+      }); }
   }
   if(t.dataset.export){ exportBucket(bucketOf(t.dataset.export)); }
   if(t.dataset.amzsheet){ const [bid,prog]=t.dataset.amzsheet.split("|"); exportAmazonSheet(bucketOf(bid), prog); }
@@ -1578,6 +1714,14 @@ document.addEventListener("toggle", e=>{
 }, true);
 function bucketOf(id){ return state.buckets.find(b=>b.id===id); }
 function refreshTotalsOnly(){ renderBuckets(); renderSummary(); }
+/* Refresh derived numbers without yanking the DOM out from under someone still typing in the grid.
+   While focus is inside #bucketGrid we rebuild only the summary table (which holds no field the user
+   could be editing); the grid's own footer catches up on the next render once they move on. */
+function refreshTotalsSafely(){
+  const grid = $("#bucketGrid");
+  if(grid && grid.contains(document.activeElement)) renderSummary();
+  else refreshTotalsOnly();
+}
 
 // drag and drop
 document.addEventListener("dragstart", e=>{
@@ -1662,7 +1806,22 @@ $("#mOk").onclick = ()=>{
 };
 $("#mCancel").onclick = ()=>{ $("#overlay").classList.remove("show"); modalCtx=null; };
 $("#overlay").addEventListener("click", e=>{ if(e.target && e.target.id==="overlay"){ $("#overlay").classList.remove("show"); modalCtx=null; } });
-$("#mCount").addEventListener("keydown", e=>{ if(e.key==="Enter") $("#mOk").click(); if(e.key==="Escape") $("#mCancel").click(); });
+$("#mCount").addEventListener("keydown", e=>{ if(e.key==="Enter") $("#mOk").click(); });
+// Escape must close the count modal from anywhere inside it, not only from the number field
+$("#overlay").addEventListener("keydown", e=>{ if(e.key==="Escape") $("#mCancel").click(); });
+/* Keep Tab inside an open modal — without this, tabbing past the last control lands on the header
+   toolbar behind the overlay, where Save/Delete are still operable by keyboard. */
+document.addEventListener("keydown", e=>{
+  if(e.key!=="Tab") return;
+  const modal = [...document.querySelectorAll(".overlay.show .modal")].pop();
+  if(!modal) return;
+  const f = [...modal.querySelectorAll('a[href],button,input,select,textarea')].filter(el=>!el.disabled && el.offsetParent!==null);
+  if(!f.length) return;
+  const first=f[0], last=f[f.length-1];
+  if(e.shiftKey && document.activeElement===first){ e.preventDefault(); last.focus(); }
+  else if(!e.shiftKey && document.activeElement===last){ e.preventDefault(); first.focus(); }
+  else if(!modal.contains(document.activeElement)){ e.preventDefault(); first.focus(); }
+});
 
 // keyboard shortcut: Cmd/Ctrl+S saves the current plan
 document.addEventListener("keydown", e=>{
@@ -1677,8 +1836,9 @@ window.addEventListener("load", ()=>{
   refreshPlanSelect();
   try{
     const wip = localStorage.getItem("shipsplit_wip");
-    if(wip){ const s=JSON.parse(wip); if(s && (s.products.length||s.buckets.length||s.planName)){ state=s; } }
+    if(wip){ const s=normalizePlan(JSON.parse(wip)); if(s.products.length||s.buckets.length||s.planName){ state=s; } }
   }catch(e){}
+  syncAddFormUnits();
   render();
   markClean(); // baseline for the unsaved-changes indicator: the state we loaded with
   // background cloud sync: never blocks first render, which already happened from localStorage above

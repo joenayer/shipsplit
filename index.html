@@ -36,7 +36,10 @@
   .field label{font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.5px}
   .field input,.field select,.field textarea{border:1px solid var(--line);border-radius:7px;padding:6px 8px;background:#fff;min-width:0}
   .field input:focus,.field select:focus,.field textarea:focus{outline:2px solid #bcd8f2;border-color:var(--blue)}
+  /* min-width:0 on the grid items stops the nested auto-fill .buckets grid from forcing its
+     intrinsic minimum onto the whole page (which pushed the body wider than a phone screen) */
   .cols{display:grid;grid-template-columns:330px 1fr;gap:16px;align-items:start}
+  .cols>*{min-width:0}
   @media(max-width:960px){.cols{grid-template-columns:1fr}}
   .panel{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow)}
   .panel-h{padding:10px 14px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;gap:8px}
@@ -60,6 +63,14 @@
   .prod .del:hover{color:var(--red)}
   /* buckets */
   .buckets{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:14px}
+  /* phones/small tablets: collapse every two-column grid to one and let children shrink, so the page
+     never needs horizontal scrolling */
+  @media(max-width:820px){
+    .buckets{grid-template-columns:1fr}
+    .bucket-fields,.trackfields,.addprod{grid-template-columns:1fr}
+    .bucket-fields>*,.trackfields>*,.addprod>*,.planbar>*{min-width:0}
+    main{padding:12px 10px 60px}
+  }
   .bucket{border:1px solid var(--line);border-radius:var(--radius);background:var(--card);box-shadow:var(--shadow);display:flex;flex-direction:column;border-top:4px solid var(--blue)}
   .bucket.mode-air{border-top-color:var(--amber)}
   .bucket.mode-ocean-west{border-top-color:var(--blue)}
@@ -141,6 +152,7 @@
   .toast.undo{pointer-events:auto}
   .undobtn{margin-left:10px;background:#2f6da8;color:#fff;border:none;border-radius:5px;padding:2px 9px;cursor:pointer;font-size:12px;font-weight:600}
   .undobtn:hover{background:#3f7fbf}
+  .undomore{color:#9fb6cc;font-size:11px;margin-left:4px}
   .filedrop{border:2px dashed var(--line);border-radius:9px;padding:14px;text-align:center;color:var(--muted);font-size:12.5px;cursor:pointer;margin-bottom:10px}
   .filedrop:hover,.filedrop.dragover{border-color:var(--blue);background:var(--blue-soft);color:var(--blue)}
   .addprod{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:8px}
