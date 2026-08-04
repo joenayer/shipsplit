@@ -1861,8 +1861,26 @@ $("#btnAcctSignin").onclick = async ()=>{
   if(!email||!password){ toast("Enter your email and password."); return; }
   const r = await acctPost("/auth/login", {email,password});
   if(!r.ok){ toast(r.data.error||"Could not sign in."); return; }
-  $("#acctPass").value=""; toast("Signed in"); refreshAccount();
+  $("#acctPass").value="";
+  /* The password was right — but the session lives in a cookie, and when the page and the API are on
+     different domains that cookie is third-party. Safari blocks those outright and Chrome is phasing
+     them out, so the browser accepts the response and silently drops the cookie. The sign-in then
+     looks like it did nothing at all. Detect it by asking who we are straight away, and say what is
+     actually wrong instead of failing mutely. */
+  const who = await refreshAccount();
+  if(!who){ showCookieBlocked(); return; }
+  toast("Signed in");
 };
+function showCookieBlocked(){
+  const el = $("#acctStatus");
+  if(el){
+    el.innerHTML = '<b>Your password was correct, but this browser blocked the sign-in cookie.</b>'
+      + ' That happens because this page and your data are on different web addresses.'
+      + ' Open <a href="' + API_DEFAULT + '/">' + API_DEFAULT.replace(/^https:\/\//,"") + '</a>'
+      + ' and sign in there — same account, everything works.';
+  }
+  toast("Blocked by this browser — use the new address");
+}
 $("#btnAcctSignup").onclick = async ()=>{
   const email=$("#acctEmail").value.trim(), password=$("#acctPass").value;
   if(!email||password.length<8){ toast("Enter an email and a password of at least 8 characters."); return; }
@@ -2539,4 +2557,22 @@ window.addEventListener("load", ()=>{
   initCloudUI();
   // and the ShipSplit account, which the Documents panel needs to know about; also non-blocking
   refreshAccount();
+  maybeOfferNewAddress();
 });
+/* The app now lives on the API's own domain. On the old GitHub Pages copy the login cookie is
+   third-party and many browsers refuse it, so point people at the address where it works instead of
+   letting them hit a wall. Dismissible, and only shown on the old origin. */
+function maybeOfferNewAddress(){
+  if(location.origin === API_DEFAULT) return;
+  if(!/github\.io$/.test(location.hostname)) return;
+  try{ if(localStorage.getItem("shipsplit-moved-dismissed")) return; }catch(e){}
+  const bar = document.createElement("div");
+  bar.className = "movedbar";
+  bar.innerHTML = 'ShipSplit has moved to <a href="' + API_DEFAULT + '/">'
+    + API_DEFAULT.replace(/^https:\/\//,"") + '</a>. '
+    + 'Signing in to your database only works there — this address keeps working for everything else. '
+    + '<button class="btn small" id="movedDismiss">Dismiss</button>';
+  document.body.insertBefore(bar, document.body.firstChild);
+  const d = document.getElementById("movedDismiss");
+  if(d) d.onclick = ()=>{ try{ localStorage.setItem("shipsplit-moved-dismissed","1"); }catch(e){} bar.remove(); };
+}
