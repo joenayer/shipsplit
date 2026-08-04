@@ -1,0 +1,12 @@
+name = "shipsplit-api"
+main = "src/index.js"
+compatibility_date = "2026-01-01"
+
+# D1 provisioned 2026-08-04 (account already hosts the paperlove-* bridges)
+[[d1_databases]]
+binding = "DB"
+database_name = "shipsplit"
+database_id = "5939066f-6a75-48c5-8bd2-b0d0f53211d1"
+
+[observability]
+enabled = true
