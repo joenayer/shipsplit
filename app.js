@@ -1378,8 +1378,13 @@ function renderBucketsInner(){
       ${(()=>{
         const inv = invOf(b), v = invoiceVariance(b), lt = invoiceLineTotal(b), amt = Number(inv.amount)||0;
         const mismatch = inv.amount!=="" && lt>0 && Math.abs(lt-amt) > 0.5;
-        return `<details class="invoice" data-invid="${b.id}" ${openInvoices.has(b.id)?"open":""}>
-        <summary>Final invoice${v?` <span class="varchip ${varianceClass(v.pct)}">${varianceText(v)} vs estimate</span>`:inv.status!=="awaiting"?` <span class="varchip even">${INVOICE_STATUS[inv.status]}</span>`:""}</summary>
+        return `<details class="section invoice" data-invid="${b.id}" ${openInvoices.has(b.id)?"open":""}>
+        <summary>Final invoice
+          ${v?`<span class="varchip ${varianceClass(v.pct)}">${varianceText(v)} vs estimate</span>`
+             :inv.status!=="awaiting"?`<span class="varchip even">${INVOICE_STATUS[inv.status]}</span>`
+             :`<span class="secsub">what the forwarder actually billed</span>`}
+        </summary>
+        <div class="secbody">
         <div class="invfields">
           <div class="field"><label>Invoice status</label>
             <select data-invstatus="${b.id}">${Object.keys(INVOICE_STATUS).map(s=>`<option value="${s}" ${s===inv.status?"selected":""}>${INVOICE_STATUS[s]}</option>`).join("")}</select></div>
@@ -1415,29 +1420,36 @@ function renderBucketsInner(){
           <span class="varchip ${varianceClass(v.pct)}">${varianceText(v)}</span>
           ${t.units?`<span class="hint">${fmt(v.actual/t.units,3)} $/unit actual</span>`:""}
         </div>`; })():""}
+        </div>
       </details>`;
       })()}
       ${(()=>{
         const list = filesFor(b.id);
-        return `<details class="files-panel" data-filesid="${b.id}" ${openFiles.has(b.id)?"open":""}>
-        <summary>Documents${list.length?` <span class="varchip even">${list.length}</span>`:""}</summary>
-        <div class="files">
+        return `<details class="section files-panel" data-filesid="${b.id}" ${openFiles.has(b.id)?"open":""}>
+        <summary>Documents
+          ${list.length?`<span class="varchip even">${list.length} attached</span>`
+                       :`<span class="secsub">invoices, labels, packing lists</span>`}
+        </summary>
+        <div class="secbody"><div class="files">
           ${list.map(f=>`<div class="filerow">
             <span class="filekind">${FILE_KINDS[f.kind]||f.kind}</span>
             <a class="fname" href="#" data-dlfile="${escAttr(f.id)}" title="${escAttr(f.fileName)}">${esc(f.fileName)}</a>
             <span class="fmeta">${humanSize(f.size)}</span>
             <button class="rm" title="Remove document" aria-label="Remove document" data-rmfile="${escAttr(f.id)}|${b.id}">✕</button>
           </div>`).join("")}
-          <div class="field"><label>Type of document</label>
-            <select data-filekind="${b.id}">${Object.keys(FILE_KINDS).map(k=>`<option value="${k}">${FILE_KINDS[k]}</option>`).join("")}</select></div>
+          <div class="filekindrow"><label for="fk-${b.id}">Type of document</label>
+            <select id="fk-${b.id}" data-filekind="${b.id}">${Object.keys(FILE_KINDS).map(k=>`<option value="${k}">${FILE_KINDS[k]}</option>`).join("")}</select></div>
           <div class="filedrop" data-filedrop="${b.id}">Drop a file here, or click to choose — invoice, label, packing list, anything worth keeping</div>
           <input type="file" data-fileinput="${b.id}" style="display:none" multiple>
-          ${apiUser ? "" : `<div class="hint" style="margin-top:6px"><a href="#" data-openacct="1">Sign in to your ShipSplit account</a> to store documents.</div>`}
-        </div>
+          ${apiUser ? "" : `<div class="hint" style="margin-top:8px"><a href="#" data-openacct="1">Sign in to your ShipSplit account</a> to store documents.</div>`}
+        </div></div>
       </details>`;
       })()}
-      <details class="tracking" data-trackid="${b.id}" ${openTracking.has(b.id)?"open":""}>
-        <summary>Tracking and status</summary>
+      <details class="section tracking" data-trackid="${b.id}" ${openTracking.has(b.id)?"open":""}>
+        <summary>Tracking and status
+          <span class="secsub">carrier, dates, reference numbers</span>
+        </summary>
+        <div class="secbody">
         <div class="trackfields">
           <div class="field"><label>Status</label>
             <select class="statuschip ${st}" data-bstatus="${b.id}">${Object.keys(STATUS_META).map(s=>`<option value="${s}" ${s===st?"selected":""}>${STATUS_META[s].label}</option>`).join("")}</select>
@@ -1458,6 +1470,7 @@ function renderBucketsInner(){
             </div>`;
           }).join("")}
           <button class="btn small" data-addref="${b.id}">+ Add reference</button>
+        </div>
         </div>
       </details>
       <div class="bucket-f">

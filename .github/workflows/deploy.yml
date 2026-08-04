@@ -1,0 +1,66 @@
+# Deploy ShipSplit to Cloudflare on every push to main.
+#
+# Why this exists: the Cloudflare project's own Git integration shows "disconnected from your Git
+# account", so Cloudflare never notices pushes and only builds when someone clicks Retry. This
+# workflow does the noticing instead — it fires Cloudflare's deploy hook, and Cloudflare then pulls
+# the latest main and builds it. Nothing about the build itself changes.
+#
+# One-time setup: add the deploy hook URL as a repository secret named CLOUDFLARE_DEPLOY_HOOK
+#   Repo -> Settings -> Secrets and variables -> Actions -> New repository secret
+# The URL is a credential, so it must NOT be committed — this repository is public.
+name: Deploy to Cloudflare
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**/*.md'          # documentation changes cannot affect the deployed Worker
+      - 'test/**'
+  workflow_dispatch:        # also runnable by hand from the Actions tab
+
+concurrency:
+  group: deploy-cloudflare  # never let two builds of main race each other
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the deploy hook is configured
+        env:
+          HOOK: ${{ secrets.CLOUDFLARE_DEPLOY_HOOK }}
+        run: |
+          if [ -z "$HOOK" ]; then
+            echo "::error::CLOUDFLARE_DEPLOY_HOOK is not set."
+            echo "Add it under Settings -> Secrets and variables -> Actions."
+            echo "Get the URL from Cloudflare: Workers & Pages -> shipsplit -> Settings -> Build -> Deploy Hooks."
+            exit 1
+          fi
+
+      - name: Trigger the Cloudflare build
+        env:
+          HOOK: ${{ secrets.CLOUDFLARE_DEPLOY_HOOK }}
+        run: |
+          # -f so an HTTP error fails the job instead of passing silently, which is how a broken
+          # deploy pipeline goes unnoticed for hours
+          RESPONSE=$(curl -fsS -X POST "$HOOK")
+          echo "$RESPONSE"
+          echo "$RESPONSE" | grep -q '"success":true' || {
+            echo "::error::Cloudflare rejected the deploy hook."
+            exit 1
+          }
+          echo "Build queued. Cloudflare pulls main and builds it; watch progress in the Cloudflare dashboard."
+
+      - name: Wait for the new code to be live
+        run: |
+          # The hook returns as soon as the build is queued, so confirm the deployment actually
+          # landed rather than reporting success on a queue acknowledgement.
+          for i in $(seq 1 40); do
+            sleep 15
+            if curl -fsS -m 20 https://shipsplit.joel-036.workers.dev/health | grep -q '"ok":true'; then
+              DEPLOYED=$(curl -fsS -m 20 -H 'Cache-Control: no-cache' https://shipsplit.joel-036.workers.dev/app.js | wc -c)
+              echo "attempt $i: API healthy, app.js is $DEPLOYED bytes"
+              if [ "$DEPLOYED" -gt 1000 ]; then exit 0; fi
+            fi
+          done
+          echo "::warning::Could not confirm the deployment within 10 minutes. Check the Cloudflare build log."

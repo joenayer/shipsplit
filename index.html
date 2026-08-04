@@ -136,7 +136,10 @@
   .chargerow .rm{border:none;background:none;color:#b9c4d0;cursor:pointer}
   .chargerow .rm:hover{color:var(--red)}
   /* attachments: invoices, labels, packing lists */
-  .files{padding:4px 0 2px}
+  .files{padding:0}
+  .filekindrow{display:flex;gap:8px;align-items:center;margin:2px 0 8px;flex-wrap:wrap}
+  .filekindrow label{font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;white-space:nowrap}
+  .filekindrow select{flex:1;min-width:140px;border:1px solid var(--line);border-radius:7px;padding:6px 8px;background:#fff}
   .filerow{display:flex;gap:8px;align-items:center;margin-bottom:6px;font-size:12.5px}
   .filerow .fname{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .filerow .fmeta{color:var(--muted);font-size:11.5px;white-space:nowrap}
@@ -146,15 +149,28 @@
   .filedrop{border:2px dashed var(--line);border-radius:8px;padding:10px;text-align:center;color:var(--muted);font-size:12.5px;cursor:pointer}
   .filedrop.over{border-color:var(--teal);background:var(--teal-soft);color:var(--teal)}
   /* final invoice: quoted vs actually billed */
-  details.invoice{margin:0 12px 8px;border-top:1px dashed var(--line);padding-top:6px}
-  details.invoice summary{cursor:pointer;font-size:12px;font-weight:600;color:var(--teal);padding:4px 0;list-style:revert;display:flex;align-items:center;gap:7px;flex-wrap:wrap}
-  .invfields{display:grid;grid-template-columns:1fr 1fr;gap:7px;padding:6px 0}
-  .invlines{padding:4px 0 2px}
-  .invlbl{display:block;font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:5px}
+  /* The three collapsible sections were styled three different ways (teal, blue, and Documents not
+     at all), so they read as unrelated bits of text rather than one kind of control. They now share
+     a single treatment: a banded header, a chevron that turns when open, and a plain-English
+     subtitle saying what is inside. */
+  details.section{margin:0 12px 8px;border:1px solid var(--line);border-radius:9px;overflow:hidden;background:#fff}
+  details.section>summary{cursor:pointer;list-style:none;padding:8px 10px;background:#f5f8fb;border-bottom:1px solid transparent;
+    display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12.5px;font-weight:700;color:var(--ink);user-select:none}
+  details.section>summary::-webkit-details-marker{display:none}
+  details.section>summary::before{content:"\25B8";color:var(--muted);font-size:12px;line-height:1;display:inline-block;transition:transform .12s ease;flex:0 0 auto}
+  details.section[open]>summary::before{transform:rotate(90deg)}
+  details.section[open]>summary{border-bottom-color:var(--line)}
+  details.section>summary:hover{background:#eaf1f8}
+  details.section>summary:focus-visible{outline:2px solid #bcd8f2;outline-offset:-2px}
+  .secsub{font-weight:400;color:var(--muted);font-size:11.5px}
+  .secbody{padding:10px}
+  .invfields{display:grid;grid-template-columns:1fr 1fr;gap:7px;padding:0 0 8px}
+  .invlines{padding:0;margin-top:12px;padding-top:10px;border-top:1px solid var(--line)}
+  .invlbl{display:block;margin-top:0;font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:5px}
   .invgrid{display:grid;grid-template-columns:1fr 1fr;gap:6px}
-  .invsum{margin-top:6px;font-size:12px;color:var(--muted)}
+  .invsum{margin-top:8px;font-size:12px;color:var(--muted)}
   .invsum.mismatch{color:var(--amber);font-weight:600}
-  .invcompare{display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin-top:8px;padding:7px 9px;background:#f8fafc;border:1px solid var(--line);border-radius:8px;font-size:12.5px}
+  .invcompare{display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin-top:12px;padding:7px 9px;background:#f8fafc;border:1px solid var(--line);border-radius:8px;font-size:12.5px}
   .invcompare b{font-variant-numeric:tabular-nums}
   /* variance chips: over budget reads red, under reads green, on-estimate stays neutral */
   .varchip{font-size:11px;font-weight:700;padding:2px 9px;border-radius:20px;white-space:nowrap;font-variant-numeric:tabular-nums}
@@ -166,10 +182,8 @@
   .varbanner.under{background:var(--green-soft);border-color:#c9e6d5;color:var(--green)}
   .varbanner b{font-variant-numeric:tabular-nums}
   /* tracking */
-  details.tracking{margin:0 12px 8px;border-top:1px dashed var(--line);padding-top:6px}
-  details.tracking summary{cursor:pointer;font-size:12px;font-weight:600;color:var(--blue);padding:4px 0;list-style:revert}
-  .trackfields{display:grid;grid-template-columns:1fr 1fr;gap:7px;padding:6px 0}
-  .refs{padding:2px 0 4px}
+  .trackfields{display:grid;grid-template-columns:1fr 1fr;gap:7px;padding:0 0 8px}
+  .refs{padding:8px 0 2px;margin-top:8px;border-top:1px solid var(--line)}
   .refrow{display:flex;gap:6px;align-items:center;margin-bottom:6px}
   .refrow select{width:130px;border:1px solid var(--line);border-radius:6px;padding:3px 5px}
   .refrow input{flex:1;min-width:0;border:1px solid var(--line);border-radius:6px;padding:3px 6px}
