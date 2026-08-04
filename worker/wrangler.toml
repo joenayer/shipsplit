@@ -12,6 +12,12 @@ database_id = "5939066f-6a75-48c5-8bd2-b0d0f53211d1"
 workers_dev = true
 preview_urls = false   # one public URL only; preview URLs would bypass the Origin allowlist
 
+# Serve the app itself from this Worker, so page and API share one origin.
+# Assets are matched first; anything that is not a file falls through to the Worker, which is how
+# /health, /auth/* and /plans/* keep working.
+[assets]
+directory = "./public"
+
 [observability]
 enabled = true
 

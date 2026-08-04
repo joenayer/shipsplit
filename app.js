@@ -175,9 +175,16 @@ const API_KEY = "shipsplit-api-base";
 /* Deployed 2026-08-04. Overridable from Cloud settings so a local wrangler dev can be pointed at
    without editing code. */
 const API_DEFAULT = "https://shipsplit.joel-036.workers.dev";
+/* When the page is served BY the Worker, talk to it with relative URLs: same origin means no CORS
+   preflight and no cross-site cookie at all. Falls back to the absolute URL while the app is still
+   served from GitHub Pages. */
 function apiBase(){
-  try { return ((localStorage.getItem(API_KEY)||API_DEFAULT)).replace(/\/+$/,""); }
-  catch(e){ return API_DEFAULT; }
+  try {
+    const override = localStorage.getItem(API_KEY);
+    if(override) return override.replace(/\/+$/,"");
+    if(location.origin === API_DEFAULT) return "";
+    return API_DEFAULT;
+  } catch(e){ return API_DEFAULT; }
 }
 function setApiBase(url){ try { localStorage.setItem(API_KEY, String(url||"").trim().replace(/\/+$/,"")); } catch(e){} }
 function cloudOn(){ return !!apiBase(); }
@@ -212,7 +219,8 @@ async function refreshAccount(){
   } catch(e){ apiUser = null; }
   paintAccount();
   renderBuckets();
-  if(apiUser) loadFiles();
+  if(apiUser){ loadFiles(); apiSyncPlans({quiet:true}); setDbState("on"); }
+  else setDbState("signedout");
   return apiUser;
 }
 function paintAccount(){
@@ -485,7 +493,7 @@ function savePlan(asNew){
   saveStore(st);
   refreshPlanSelect(); render(); markClean();
   toast('Saved "'+name+'"');
-  pushToCloud();
+  syncEverywhere({quiet:true});
 }
 function openPlan(name){
   const st = loadStore();
@@ -511,7 +519,7 @@ function saveGhConfig(cfg){ localStorage.setItem(GH_KEY, JSON.stringify(cfg)); }
 function setCloudState(s){
   cloudState = s;
   const b = $("#btnCloud");
-  if(b) b.textContent = s==="on" ? "Cloud: on" : s==="error" ? "Cloud: error" : "Cloud: off";
+  if(b) b.textContent = s==="on" ? "GitHub: on" : s==="error" ? "GitHub: error" : "GitHub: off";
   updateSyncInfo();
 }
 function syncAgoText(){
@@ -621,8 +629,68 @@ async function pullAndMerge(opts){
     return null;
   }
 }
+/* ================= ShipSplit database sync (primary) =================
+   Plans live in the ShipSplit database now. GitHub stays wired up underneath as a backup while the
+   switch beds in — a plan you save is written to the browser, then to the database, then to GitHub,
+   so no single one of them holds the only copy.
+
+   The server does the same newer-wins merge the local mergeStores() does, and hands the merged set
+   back, so one /plans/sync call covers both directions. */
+async function apiSyncPlans(opts){
+  opts = opts || {};
+  if(!apiUser) return null;                 // not signed in: local + GitHub only
+  const localRaw = loadRawStore();
+  const plans = {}, deleted = Object.assign({}, localRaw.__deleted__ || {});
+  for(const k in localRaw){ if(k!=="__deleted__" && localRaw[k]) plans[k] = localRaw[k]; }
+  try{
+    const res = await apiFetch("/plans/sync", {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({plans, deleted}),
+    });
+    if(!res.ok){
+      if(res.status===401){ apiUser=null; paintAccount(); setDbState("signedout"); }
+      else setDbState("error");
+      return null;
+    }
+    const data = await res.json();
+    const merged = Object.assign({}, data.plans || {}, {__deleted__: pruneTombstones(data.deleted || {})});
+    const before = JSON.stringify(localRaw);
+    const after = JSON.stringify(merged);
+    localStorage.setItem(LS_KEY, after);
+    reconcileOpenPlan(merged);              // keep the open plan in step with what just merged in
+    refreshPlanSelect();
+    setDbState("on");
+    markSynced();
+    if(!opts.quiet || before !== after) toast(opts.savedMsg || "Saved to the cloud database");
+    return merged;
+  }catch(err){
+    setDbState("offline");
+    if(!opts.quiet) toast("Saved locally — cloud database unreachable");
+    return null;
+  }
+}
+/* Save/delete path: database first (it is the record), then GitHub as a redundant copy. */
+async function syncEverywhere(opts){
+  const merged = await apiSyncPlans(opts);
+  // GitHub only runs if it is still configured; failures there are no longer user-facing noise
+  if(loadGhConfig().token){ try { await pushToCloud({quiet:true}); } catch(e){} }
+  return merged;
+}
+function setDbState(s){
+  const b = $("#btnDb");
+  if(!b) return;
+  b.textContent = s==="on" ? "Database ✓"
+    : s==="offline" ? "Database: offline"
+    : s==="error" ? "Database: error"
+    : "Database: sign in";
+  b.title = s==="on" ? "Plans are saved to your ShipSplit cloud database"
+    : s==="signedout" ? "Sign in from Account to save plans to the cloud database"
+    : "Plans are saved on this device; the cloud database could not be reached";
+}
+
 /* Push local plans up after a local save/delete. Never blocks or undoes the local write; only reports the outcome. */
-async function pushToCloud(){
+async function pushToCloud(opts){
+  opts = opts || {};
   const cfg = loadGhConfig();
   if(!cfg.token) return;
   try{
@@ -634,8 +702,9 @@ async function pushToCloud(){
     }
     setCloudState("on");
     markSynced();
-    toast("Saved locally + cloud");
+    if(!opts.quiet) toast("Saved locally + cloud");
   }catch(err){
+    if(opts.quiet) return;                  // backup copy: never interrupt over it
     if(err && err.authError){ setCloudState("error"); toast("GitHub token rejected. Open Cloud settings."); }
     else{ toast("Saved locally, cloud failed: "+cloudErrorMessage(err)); }
   }
@@ -1546,7 +1615,7 @@ $("#btnDeletePlan").onclick = ()=>{
   if(!name){ toast("No saved plan selected"); return; }
   if(!confirm('Delete saved plan "'+name+'"?')) return;
   const st = loadStore(); delete st[name]; saveStore(st); addTombstone(name); refreshPlanSelect(); toast("Deleted");
-  pushToCloud();
+  syncEverywhere({quiet:true});
 };
 $("#planSelect").onchange = e=>{ if(e.target.value) openPlan(e.target.value); };
 $("#btnExportJson").onclick = ()=>{
@@ -1778,6 +1847,7 @@ function openAccount(){
   refreshAccount();
 }
 $("#btnAccount").onclick = openAccount;
+$("#btnDb").onclick = ()=>{ if(apiUser) syncEverywhere({}); else openAccount(); };
 $("#btnAcctClose").onclick = ()=>{ $("#acctOverlay").classList.remove("show"); };
 $("#acctOverlay").addEventListener("click", e=>{ if(e.target && e.target.id==="acctOverlay") $("#btnAcctClose").click(); });
 $("#acctApi").addEventListener("change", e=>{
@@ -1843,7 +1913,11 @@ $("#btnAcctDownloadCodes").onclick = ()=>{
   setTimeout(()=>URL.revokeObjectURL(url),10000);
 };
 /* Sync on a device that isn't signed in yet has nothing to pull -> open the sign in / sign up modal instead */
-$("#btnSync").onclick = ()=>{ if(!loadGhConfig().token){ openCloudModal(); return; } pullAndMerge(); };
+$("#btnSync").onclick = async ()=>{
+  if(apiUser){ await syncEverywhere({}); return; }
+  if(loadGhConfig().token){ pullAndMerge(); return; }
+  openAccount();   // nothing configured: the database is the thing to set up now, not GitHub
+};
 
 // Sign in / Sign up tabs -- carry the typed identifier across so switching never loses it
 $("#ghTabSignin").onclick = ()=>{

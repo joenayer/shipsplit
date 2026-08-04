@@ -8,10 +8,19 @@
 import { projectPlan, PROJECTION_TABLES } from "./project.js";
 
 const ALLOWED_ORIGINS = [
-  "https://joenayer.github.io",
+  "https://shipsplit.joel-036.workers.dev",   // the app served from this Worker (same origin)
+  "https://joenayer.github.io",               // GitHub Pages, kept working during the switchover
   "http://localhost:8788",
   "http://127.0.0.1:8788",
 ];
+/* A same-origin form/fetch may send no Origin header at all. That is not a cross-site request, so
+   refusing it would break the app served from this very Worker — but we must still refuse a
+   cross-site request carrying a foreign Origin. Absent-and-same-host is allowed; anything else is not. */
+function originAllowed(origin, req) {
+  if (origin) return ALLOWED_ORIGINS.includes(origin);
+  const site = req.headers.get("Sec-Fetch-Site");
+  return site === "same-origin" || site === "none";
+}
 /* Cloudflare Workers rejects PBKDF2 above 100,000 iterations outright — the deriveBits call throws
    rather than merely running slowly, so 310,000 made every signup and sign-in return a 500. This is
    an API ceiling, not a CPU budget, so it cannot be bought around with a bigger plan.
@@ -575,13 +584,14 @@ export default {
        cannot read the reply. Verified exploitable against /plans/sync before this check existed.
        Every mutating request must therefore carry an Origin we recognise. */
     if (req.method !== "GET" && req.method !== "HEAD") {
-      if (!ALLOWED_ORIGINS.includes(origin)) {
+      if (!originAllowed(origin, req)) {
         return json({ error: "Bad origin." }, 403, origin);
       }
     }
 
     try {
-      if (path === "/" || path === "/health") return json({ ok: true, service: "shipsplit-api" }, 200, origin);
+      // "/" is the app page, served from [assets]; only /health is the API probe
+      if (path === "/health") return json({ ok: true, service: "shipsplit-api" }, 200, origin);
 
       if (path === "/auth/signup" && req.method === "POST") return await signup(req, env, origin, ip);
       if (path === "/auth/login" && req.method === "POST") return await login(req, env, origin, ip);

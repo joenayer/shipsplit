@@ -14,6 +14,8 @@ to check a rendering change is to render it.
 | `prop.js` | product weight/dimension edits propagating to every shipment |
 | `rates.js` | billed weight/volume, metric storage under the unit toggle, $/weight and $/volume rates |
 | `packing.js` | packing list carries no commercial or internal data, and every carton names its PO |
+| `dbsync.js` | plans save to the cloud database first, GitHub demoted to a backup |
+| `account.js` | live end-to-end against the deployed Worker — skips when there is no network |
 
 Worker + database tests live in `worker/test/` and need no browser:
 

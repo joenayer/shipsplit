@@ -4,7 +4,8 @@
   "type": "module",
   "description": "ShipSplit API — Cloudflare Worker + D1 + R2. No build step: wrangler bundles src/index.js directly.",
   "scripts": {
-    "deploy": "wrangler deploy",
+    "build": "node build.mjs",
+    "deploy": "node build.mjs && wrangler deploy",
     "dev": "wrangler dev",
     "test": "node test/run.mjs && node test/project.mjs"
   },
