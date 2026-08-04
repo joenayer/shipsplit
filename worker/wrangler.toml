@@ -3,14 +3,16 @@ name = "shipsplit"
 main = "src/index.js"
 compatibility_date = "2026-01-01"
 
-# D1 provisioned 2026-08-04 (account already hosts the paperlove-* bridges)
-[[d1_databases]]
-binding = "DB"
-database_name = "shipsplit"
-database_id = "5939066f-6a75-48c5-8bd2-b0d0f53211d1"
-
+# TOML scoping matters: these are top-level settings and MUST stay above the first [[table]] below.
+# Placed after one, they were silently parsed as fields of that table and rejected.
 workers_dev = true
 preview_urls = false   # one public URL only; preview URLs would bypass the Origin allowlist
+
+# Stage the app's static files into ./public before deploying. The Cloudflare build runs
+# `npx wrangler deploy` directly rather than an npm script, so the staging step has to hang off
+# wrangler itself — otherwise ./public does not exist at deploy time and the build fails.
+[build]
+command = "node build.mjs"
 
 # Serve the app itself from this Worker, so page and API share one origin.
 # Assets are matched first; anything that is not a file falls through to the Worker, which is how
@@ -20,6 +22,12 @@ directory = "./public"
 
 [observability]
 enabled = true
+
+# D1 provisioned 2026-08-04 (account already hosts the paperlove-* bridges)
+[[d1_databases]]
+binding = "DB"
+database_name = "shipsplit"
+database_id = "5939066f-6a75-48c5-8bd2-b0d0f53211d1"
 
 # Object storage for shipment attachments (invoices, labels, packing lists). Blobs never go in D1.
 [[r2_buckets]]
