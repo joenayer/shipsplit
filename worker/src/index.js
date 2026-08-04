@@ -12,9 +12,12 @@ const ALLOWED_ORIGINS = [
 ];
 const PBKDF2_ITERATIONS = 310000;
 const SESSION_DAYS = 30;
-const MAX_FAILED = 10;              // failed sign-ins ...
+const MAX_FAILED = 10;              // failed sign-ins from one IP ...
 const FAIL_WINDOW_MS = 15 * 60000;  // ... within this window before we start refusing
+const MAX_FAILED_EMAIL = 50;        // distributed-guessing backstop; only counts WRONG passwords
+const MAX_SIGNUPS_PER_IP = 5;       // account creation is unauthenticated and costs a PBKDF2
 const MAX_PLAN_BYTES = 2 * 1024 * 1024;
+const MAX_PLAN_DEPTH = 32;          // plans nest ~5 deep; anything near this is pathological
 
 /* ---------- small helpers ---------- */
 const enc = new TextEncoder();
@@ -122,11 +125,25 @@ async function startSession(env, userId) {
   ).bind(uid(), userId, await sha256b64(token), now(), expires).run();
   return { token, maxAge: SESSION_DAYS * 86400 };
 }
-async function tooManyFailures(env, key) {
+async function tooManyFailures(env, key, limit) {
   const since = now() - FAIL_WINDOW_MS;
   const row = await env.DB.prepare("SELECT COUNT(*) AS n FROM login_attempts WHERE key = ? AND at > ?")
     .bind(key, since).first();
-  return (row && row.n) >= MAX_FAILED;
+  return (row && row.n) >= (limit || MAX_FAILED);
+}
+/* Reject bodies that are pathologically NESTED. The byte cap can't help here: JSON.stringify
+   recurses per level and blows the stack before we ever get a length to measure. Iterative so the
+   check itself cannot overflow on the very input it is guarding against. */
+function exceedsDepth(root, max) {
+  const stack = [[root, 0]];
+  while (stack.length) {
+    const [value, depth] = stack.pop();
+    if (depth > max) return true;
+    if (value && typeof value === "object") {
+      for (const k in value) stack.push([value[k], depth + 1]);
+    }
+  }
+  return false;
 }
 async function noteFailure(env, key) {
   await env.DB.prepare("INSERT INTO login_attempts (id, key, at) VALUES (?,?,?)").bind(uid(), key, now()).run();
@@ -137,7 +154,13 @@ async function clearFailures(env, key) {
 }
 
 /* ---------- route handlers ---------- */
-async function signup(req, env, origin) {
+async function signup(req, env, origin, ip) {
+  /* account creation is unauthenticated and each one costs a full PBKDF2 plus 10 rows, so it needs
+     the same per-IP ceiling the other public routes have */
+  const keySignup = "signup:" + ip;
+  if (await tooManyFailures(env, keySignup, MAX_SIGNUPS_PER_IP)) {
+    return json({ error: "Too many accounts created from this device. Try again later." }, 429, origin);
+  }
   const body = await req.json().catch(() => ({}));
   const email = normEmail(body.email);
   const password = String(body.password || "");
@@ -165,17 +188,44 @@ async function signup(req, env, origin) {
   }
   await env.DB.batch(batch);
 
+  await noteFailure(env, keySignup); // counts toward the per-IP account-creation ceiling
   const { token, maxAge } = await startSession(env, userId);
   return json({ email, recoveryCodes: codes }, 200, origin, { "Set-Cookie": sessionCookie(token, maxAge) });
+}
+/* Issue a fresh batch of recovery codes. Without this, burning all eight leaves the account with no
+   reset path at all — the very lockout this design exists to prevent. Requires the current password. */
+async function regenerateCodes(req, env, user, origin) {
+  const body = await req.json().catch(() => ({}));
+  const password = String(body.password || "");
+  const row = await env.DB.prepare("SELECT pw_salt, pw_hash, iterations FROM users WHERE id = ?").bind(user.id).first();
+  if (!row) return json({ error: "Not signed in." }, 401, origin);
+  const attempt = await pbkdf2(password, row.pw_salt, row.iterations);
+  if (!safeEqual(attempt, row.pw_hash)) return json({ error: "Wrong password." }, 401, origin);
+
+  const codes = [];
+  const ops = [env.DB.prepare("DELETE FROM recovery_codes WHERE user_id = ? AND used_at IS NULL").bind(user.id)];
+  const stmt = env.DB.prepare("INSERT INTO recovery_codes (id, user_id, code_hash, used_at) VALUES (?,?,?,NULL)");
+  for (let i = 0; i < 8; i++) {
+    const code = recoveryCode();
+    codes.push(code);
+    ops.push(stmt.bind(uid(), user.id, await sha256b64(code)));
+  }
+  await env.DB.batch(ops);
+  return json({ recoveryCodes: codes }, 200, origin);
 }
 
 async function login(req, env, origin, ip) {
   const body = await req.json().catch(() => ({}));
   const email = normEmail(body.email);
   const password = String(body.password || "");
-  const keyEmail = "email:" + email, keyIp = "ip:" + ip;
-  if (await tooManyFailures(env, keyEmail) || await tooManyFailures(env, keyIp)) {
-    return json({ error: "Too many failed attempts. Wait 15 minutes and try again." }, 429, origin);
+  const keyIp = "ip:" + ip, keyEmail = "email:" + email;
+
+  /* Throttle on the ATTACKER's side of the request (their IP) before doing any work. We deliberately
+     do NOT pre-block on the email key: doing so let anyone who merely knows the account's address
+     lock the real owner out from their own IP by burning 10 wrong guesses. A correct password now
+     always succeeds; the email counter only ever throttles further WRONG guesses (see below). */
+  if (await tooManyFailures(env, keyIp)) {
+    return json({ error: "Too many failed attempts from this device. Wait 15 minutes." }, 429, origin);
   }
   const user = await env.DB.prepare("SELECT id, pw_salt, pw_hash, iterations FROM users WHERE email = ?").bind(email).first();
   // always run a derivation so a missing account and a wrong password cost the same
@@ -183,10 +233,15 @@ async function login(req, env, origin, ip) {
   const iters = user ? user.iterations : PBKDF2_ITERATIONS;
   const attempt = await pbkdf2(password, salt, iters);
   if (!user || !safeEqual(attempt, user.pw_hash)) {
-    await noteFailure(env, keyEmail); await noteFailure(env, keyIp);
+    await noteFailure(env, keyIp); await noteFailure(env, keyEmail);
+    // distributed-guessing backstop: only reached when the password was ALREADY wrong, so a
+    // legitimate sign-in can never be refused by it
+    if (await tooManyFailures(env, keyEmail, MAX_FAILED_EMAIL)) {
+      return json({ error: "Too many failed attempts for this account. Wait 15 minutes." }, 429, origin);
+    }
     return json({ error: "Wrong email or password." }, 401, origin);
   }
-  await clearFailures(env, keyEmail); await clearFailures(env, keyIp);
+  await clearFailures(env, keyIp); await clearFailures(env, keyEmail);
   const { token, maxAge } = await startSession(env, user.id);
   return json({ email }, 200, origin, { "Set-Cookie": sessionCookie(token, maxAge) });
 }
@@ -196,18 +251,27 @@ async function recover(req, env, origin, ip) {
   const email = normEmail(body.email);
   const code = String(body.code || "").trim().toUpperCase();
   const newPassword = String(body.newPassword || "");
-  const keyIp = "ip:" + ip;
-  if (await tooManyFailures(env, keyIp)) return json({ error: "Too many attempts. Wait 15 minutes." }, 429, origin);
+  const keyIp = "ip:" + ip, keyRecEmail = "recover:" + email;
+  // throttle per IP and per account, mirroring login (an attacker rotating IPs was otherwise unbounded)
+  if (await tooManyFailures(env, keyIp) || await tooManyFailures(env, keyRecEmail, MAX_FAILED_EMAIL)) {
+    return json({ error: "Too many attempts. Wait 15 minutes." }, 429, origin);
+  }
   if (newPassword.length < 8) return json({ error: "New password must be at least 8 characters." }, 400, origin);
 
   const user = await env.DB.prepare("SELECT id FROM users WHERE email = ?").bind(email).first();
-  if (!user) { await noteFailure(env, keyIp); return json({ error: "Wrong email or recovery code." }, 401, origin); }
+  if (!user) {
+    // do the same hash + lookup an existing account would, so a missing email isn't detectable by timing
+    await env.DB.prepare("SELECT id FROM recovery_codes WHERE user_id = ? AND code_hash = ? AND used_at IS NULL")
+      .bind("no-such-user", await sha256b64(code)).first();
+    await noteFailure(env, keyIp); await noteFailure(env, keyRecEmail);
+    return json({ error: "Wrong email or recovery code." }, 401, origin);
+  }
 
   const codeHash = await sha256b64(code);
   const row = await env.DB.prepare(
     "SELECT id FROM recovery_codes WHERE user_id = ? AND code_hash = ? AND used_at IS NULL"
   ).bind(user.id, codeHash).first();
-  if (!row) { await noteFailure(env, keyIp); return json({ error: "Wrong email or recovery code." }, 401, origin); }
+  if (!row) { await noteFailure(env, keyIp); await noteFailure(env, keyRecEmail); return json({ error: "Wrong email or recovery code." }, 401, origin); }
 
   const salt = randomB64(16);
   const hash = await pbkdf2(newPassword, salt, PBKDF2_ITERATIONS);
@@ -217,7 +281,7 @@ async function recover(req, env, origin, ip) {
     // a password reset invalidates every existing session
     env.DB.prepare("DELETE FROM sessions WHERE user_id = ?").bind(user.id),
   ]);
-  await clearFailures(env, keyIp);
+  await clearFailures(env, keyIp); await clearFailures(env, keyRecEmail);
   const { token, maxAge } = await startSession(env, user.id);
   const left = await env.DB.prepare("SELECT COUNT(*) AS n FROM recovery_codes WHERE user_id = ? AND used_at IS NULL").bind(user.id).first();
   return json({ email, codesRemaining: left ? left.n : 0 }, 200, origin, { "Set-Cookie": sessionCookie(token, maxAge) });
@@ -242,6 +306,7 @@ async function getPlan(env, user, name, origin) {
 async function putPlan(req, env, user, name, origin) {
   const body = await req.json().catch(() => ({}));
   if (!body || typeof body.data !== "object" || body.data === null) return json({ error: "Missing plan data." }, 400, origin);
+  if (exceedsDepth(body.data, MAX_PLAN_DEPTH)) return json({ error: "Plan structure is nested too deeply." }, 400, origin);
   const serialized = JSON.stringify(body.data);
   if (serialized.length > MAX_PLAN_BYTES) return json({ error: "Plan is too large." }, 413, origin);
   const incoming = Number(body.updatedAt) || now();
@@ -251,16 +316,21 @@ async function putPlan(req, env, user, name, origin) {
       .bind(uid(), user.id, name, serialized, incoming).run();
     return json({ name, updatedAt: incoming, written: true }, 200, origin);
   }
-  if (existing.updated_at > incoming && !existing.deleted_at) {
-    return json({ name, updatedAt: existing.updated_at, written: false, reason: "server copy is newer" }, 200, origin);
+  /* A deletion is just another timestamped event: an older write must not resurrect it. Previously the
+     "&& !existing.deleted_at" carve-out meant ANY write, however stale, revived a deleted plan with
+     ancient data — reachable simply by an offline device syncing late. */
+  if (existing.updated_at > incoming) {
+    return json({ name, updatedAt: existing.updated_at, written: false, reason: existing.deleted_at ? "deleted more recently" : "server copy is newer" }, 200, origin);
   }
   await env.DB.prepare("UPDATE plans SET data = ?, updated_at = ?, deleted_at = NULL WHERE id = ?")
     .bind(serialized, incoming, existing.id).run();
   return json({ name, updatedAt: incoming, written: true }, 200, origin);
 }
 async function deletePlan(env, user, name, origin) {
-  await env.DB.prepare("UPDATE plans SET deleted_at = ? WHERE user_id = ? AND name = ?").bind(now(), user.id, name).run();
-  return json({ name, deleted: true }, 200, origin);
+  // stamp updated_at too, so newer-wins treats the deletion as the latest event for this plan
+  const ts = now();
+  await env.DB.prepare("UPDATE plans SET deleted_at = ?, updated_at = ? WHERE user_id = ? AND name = ?").bind(ts, ts, user.id, name).run();
+  return json({ name, deleted: true, updatedAt: ts }, 200, origin);
 }
 /* Full two-way merge, mirroring the client's mergeStores(): newer updatedAt wins, a delete that is
    newer than the surviving copy wins. Returns everything the client should now hold. */
@@ -275,6 +345,7 @@ async function syncPlans(req, env, user, origin) {
   for (const name of Object.keys(incoming)) {
     const plan = incoming[name];
     if (!plan || typeof plan !== "object") continue;
+    if (exceedsDepth(plan, MAX_PLAN_DEPTH)) continue;
     const serialized = JSON.stringify(plan);
     if (serialized.length > MAX_PLAN_BYTES) continue;
     const ts = Number(plan.updatedAt) || 0;
@@ -331,7 +402,7 @@ export default {
     try {
       if (path === "/" || path === "/health") return json({ ok: true, service: "shipsplit-api" }, 200, origin);
 
-      if (path === "/auth/signup" && req.method === "POST") return await signup(req, env, origin);
+      if (path === "/auth/signup" && req.method === "POST") return await signup(req, env, origin, ip);
       if (path === "/auth/login" && req.method === "POST") return await login(req, env, origin, ip);
       if (path === "/auth/recover" && req.method === "POST") return await recover(req, env, origin, ip);
 
@@ -347,6 +418,7 @@ export default {
       }
       if (!user) return json({ error: "Not signed in." }, 401, origin);
 
+      if (path === "/auth/recovery-codes" && req.method === "POST") return await regenerateCodes(req, env, user, origin);
       if (path === "/plans" && req.method === "GET") return await listPlans(env, user, origin);
       if (path === "/plans/sync" && req.method === "POST") return await syncPlans(req, env, user, origin);
 

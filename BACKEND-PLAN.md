@@ -35,15 +35,29 @@ Email + password, with **recovery codes instead of a password-reset email** — 
 system has no dependency on an email provider and no "reset link" attack surface.
 
 - Password hashing: **PBKDF2-SHA256, 310k iterations**, 16-byte random salt, via WebCrypto (the same
-  primitive the current client already uses, and available natively in Workers).
-- On sign-up the user is shown **8 one-time recovery codes**. Each is stored only as a hash. Any one
-  code logs you in once and forces setting a new password. This is the fix for the exact failure that
-  motivated the migration.
-- Sessions: opaque 32-byte random token, SHA-256 hashed at rest, delivered as a
+  primitive the current client already uses, and available natively in Workers). Current OWASP
+  guidance is ~600k; 310k is the deliberate choice here because each sign-in spends that as Worker
+  CPU, and the free plan's per-request CPU budget is tight. `iterations` is stored per user, so
+  raising it later is a one-constant change that upgrades accounts as they next set a password —
+  no migration.
+- On sign-up the user is shown **8 one-time recovery codes** (80 bits each, unambiguous alphabet).
+  Each is stored only as a hash. Any one code logs you in once and forces setting a new password.
+  This is the fix for the exact failure that motivated the migration. `POST /auth/recovery-codes`
+  (authenticated, re-asks for the password) issues a fresh batch, so exhausting all eight is not a
+  dead end.
+- Sessions: opaque 32-byte random token (base64url), SHA-256 hashed at rest, delivered as a
   `HttpOnly; Secure; SameSite=None` cookie (None is required — the page is on `github.io`, the API on
-  `workers.dev`), 30-day sliding expiry, revocable server-side.
-- Rate limiting: failed sign-in attempts are counted per account and per IP in D1; back off after 10
-  in 15 minutes. Prevents trivial online guessing of the password.
+  `workers.dev`), **fixed 30-day expiry** (not sliding — activity does not extend it, so a stolen
+  session cannot be kept alive indefinitely), revocable server-side and killed en masse on
+  password reset.
+- **CSRF:** `SameSite=None` means the browser attaches the cookie cross-site, and CORS does not stop a
+  "simple" request (`Content-Type: text/plain` skips the preflight and still reaches the handler).
+  Every mutating request therefore requires a recognised `Origin`; this was verified exploitable
+  against `/plans/sync` before the check existed.
+- Rate limiting: per-IP back-off (10 failures / 15 min) on sign-in, recovery and sign-up. The
+  per-account counter is a distributed-guessing backstop that is only ever consulted **after** a
+  password has already proved wrong — so someone who knows the email cannot lock the owner out by
+  burning failed attempts, which an earlier per-account pre-check did allow.
 
 ## Data model
 
@@ -67,6 +81,7 @@ POST /auth/login     {email, password}          -> sets session cookie
 POST /auth/recover   {email, code, newPassword} -> sets session cookie
 POST /auth/logout
 GET  /auth/me                                   -> {email} | 401
+POST /auth/recovery-codes {password}            -> {recoveryCodes[]}  (fresh batch, invalidates unused)
 GET  /plans                                     -> [{name, updatedAt}]        (index, no bodies)
 GET  /plans/:name                               -> {name, data, updatedAt}
 PUT  /plans/:name    {data, updatedAt}          -> newer-wins upsert

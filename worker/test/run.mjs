@@ -31,7 +31,9 @@ async function call(method, path, body, opts = {}) {
   if (body !== undefined) headers["Content-Type"] = "application/json";
   if (cookie && !opts.noCookie) headers["Cookie"] = cookie;
   const req = new Request("https://api.test" + path, {
-    method, headers, body: body === undefined ? undefined : JSON.stringify(body),
+    method, headers,
+    // rawBody lets a test send a payload too deep for the harness itself to JSON.stringify
+    body: opts.rawBody !== undefined ? opts.rawBody : (body === undefined ? undefined : JSON.stringify(body)),
   });
   const res = await worker.fetch(req, env);
   const setCookie = res.headers.get("Set-Cookie");
@@ -211,6 +213,70 @@ ck("logout succeeds", r.status === 200);
 cookie = liveCookie;
 r = await call("GET", "/auth/me");
 ck("session is dead after logout", r.status === 401);
+
+/* ---------- fixes from the security review ---------- */
+
+/* an attacker who knows the email must NOT be able to lock the owner out of their own IP */
+{
+  cookie = "";
+  await call("POST", "/auth/signup", { email: "victim@test.com", password: "the real password" }, { ip: "203.0.113.77" });
+  cookie = "";
+  for (let i = 0; i < 12; i++) {
+    await call("POST", "/auth/login", { email: "victim@test.com", password: "guess" + i }, { ip: "198.51.100.66" });
+  }
+  const attacker = await call("POST", "/auth/login", { email: "victim@test.com", password: "guess-again" }, { ip: "198.51.100.66" });
+  ck("attacker's own IP does get throttled", attacker.status === 429);
+  cookie = "";
+  const victim = await call("POST", "/auth/login", { email: "victim@test.com", password: "the real password" }, { ip: "203.0.113.1" });
+  ck("victim with the CORRECT password is NOT locked out", victim.status === 200);
+}
+
+/* account creation is unauthenticated and costs a PBKDF2 each time */
+{
+  cookie = "";
+  let blocked = false;
+  for (let i = 0; i < 9; i++) {
+    const r2 = await call("POST", "/auth/signup", { email: "flood" + i + "@test.com", password: "password12345" }, { ip: "198.51.100.200" });
+    if (r2.status === 429) { blocked = true; break; }
+  }
+  ck("signup is rate limited per IP", blocked);
+}
+
+/* a stale write must not resurrect a deleted plan */
+{
+  cookie = "";
+  await call("POST", "/auth/login", { email: "victim@test.com", password: "the real password" }, { ip: "203.0.113.2" });
+  await call("PUT", "/plans/Doomed", { data: { contents: "current" }, updatedAt: 1000 });
+  await call("DELETE", "/plans/Doomed");
+  const stale = await call("PUT", "/plans/Doomed", { data: { contents: "ANCIENT STALE DATA" }, updatedAt: 1 });
+  ck("stale PUT cannot resurrect a deleted plan", stale.body.written === false);
+  const idx = await call("GET", "/plans");
+  ck("resurrected plan does not reappear in the index", !idx.body.plans.some(p => p.name === "Doomed"));
+  const fresh = await call("PUT", "/plans/Doomed", { data: { contents: "deliberately restored" }, updatedAt: Date.now() + 60000 });
+  ck("a genuinely newer write CAN restore it", fresh.body.written === true);
+}
+
+/* deeply nested JSON used to blow the stack inside JSON.stringify and surface as a 500 */
+{
+  const N = 50000;   // built as a raw string: too deep for JSON.stringify to walk
+  const rawBody = '{"updatedAt":' + Date.now() + ',"data":' + '{"n":'.repeat(N) + "{}" + "}".repeat(N) + "}";
+  const r2 = await call("PUT", "/plans/Nested", undefined, { rawBody });
+  ck("pathologically nested plan is rejected with 400, not a 500", r2.status === 400);
+  const alive = await call("GET", "/auth/me");
+  ck("API still healthy after the nesting attempt", alive.status === 200);
+}
+
+/* burning all 8 recovery codes must not be a dead end */
+{
+  const bad = await call("POST", "/auth/recovery-codes", { password: "not the password" });
+  ck("regenerating codes requires the current password", bad.status === 401);
+  const ok = await call("POST", "/auth/recovery-codes", { password: "the real password" });
+  ck("recovery codes can be regenerated", ok.status === 200 && (ok.body.recoveryCodes || []).length === 8);
+  const fresh = ok.body.recoveryCodes[0];
+  cookie = "";
+  const used = await call("POST", "/auth/recover", { email: "victim@test.com", code: fresh, newPassword: "a replacement password" }, { ip: "203.0.113.30" });
+  ck("a regenerated code actually works", used.status === 200);
+}
 
 console.log(results.join("\n"));
 const failed = results.filter(x => x.startsWith("FAIL")).length;
