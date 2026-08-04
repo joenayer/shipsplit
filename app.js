@@ -1315,6 +1315,7 @@ function renderCloudModalView(view){
   $("#ghUnlockView").style.display = view==="unlock" ? "" : "none";
   $("#ghConnectedView").style.display = view==="connected" ? "" : "none";
   $("#ghAdvancedView").style.display = view==="advanced" ? "" : "none";
+  const rec = $("#ghRecoverView"); if(rec) rec.style.display = view==="recover" ? "" : "none";
   $("#btnGhDisconnect").style.display = view==="connected" ? "" : "none";
   $("#ghStatus").textContent = "";
   // Sign in / Sign up tabs are only meaningful on the two auth forms
@@ -1327,8 +1328,15 @@ function renderCloudModalView(view){
   const title = $("#ghModalTitle");
   const toggle = $("#ghAdvancedToggle");
   const primary = $("#btnGhPrimary");
-  if(title){ title.textContent = view==="unlock" ? "Sign in" : view==="setup" ? "Sign up" : view==="advanced" ? "Advanced setup" : "Cloud sync"; }
-  if(view==="detecting"){
+  if(title){ title.textContent = view==="unlock" ? "Sign in" : view==="setup" ? "Sign up" : view==="advanced" ? "Advanced setup" : view==="recover" ? "Can't sign in" : "Cloud sync"; }
+  if(view==="recover"){
+    toggle.style.display = "none"; primary.style.display = "none";
+    // tell the user up front whether THIS device can do the one-click reset
+    const hint = $("#ghResetHint"), btn = $("#btnGhResetHere");
+    const has = !!loadGhConfig().token;
+    if(hint) hint.textContent = has ? "this device can" : "this device has no token stored";
+    if(btn) btn.disabled = !has;
+  } else if(view==="detecting"){
     toggle.style.display = "none"; primary.style.display = "none";
   } else if(view==="setup"){
     toggle.style.display = ""; toggle.textContent = "Advanced: paste token directly";
@@ -1418,6 +1426,32 @@ $("#ghChangeLink").onclick = (e)=>{
   $("#ghSetupToken").value = cfg.token||"";
   $("#ghSetupPass1").value = ""; $("#ghSetupPass2").value = "";
   $("#ghStatus").textContent = "Prefilled with your current token. Set an email/username + password and press Sign up to re-encrypt.";
+};
+/* Password reset that needs NO old password: a device that is already signed in still holds the
+   token in localStorage, so it can simply re-encrypt it under a new password and overwrite the
+   stored login (the account entry is keyed by the identifier, so signing up again replaces it). */
+function startPasswordReset(){
+  const cfg = loadGhConfig();
+  if(!cfg.token){
+    renderCloudModalView("recover");
+    $("#ghStatus").textContent = "This device has no saved token, so it can't reset the password. Use option 2 or 3.";
+    return;
+  }
+  renderCloudModalView("setup");
+  $("#ghSetupId").value = cfg.ident||"";
+  $("#ghSetupToken").value = cfg.token;
+  $("#ghSetupPass1").value = ""; $("#ghSetupPass2").value = "";
+  $("#ghStatus").textContent = "Using the token already on this device — pick a NEW password and press Sign up. The old password stops working.";
+  setTimeout(()=>{ const el = cfg.ident ? $("#ghSetupPass1") : $("#ghSetupId"); if(el) el.focus(); }, 30);
+}
+$("#ghForgotLink").onclick = (e)=>{ e.preventDefault(); renderCloudModalView("recover"); };
+$("#btnGhResetPass").onclick = startPasswordReset;
+$("#btnGhResetHere").onclick = startPasswordReset;
+$("#btnGhToSignup").onclick = ()=>{
+  renderCloudModalView("setup");
+  const cfg = loadGhConfig();
+  $("#ghSetupId").value = cfg.ident||""; $("#ghSetupToken").value = ""; $("#ghSetupPass1").value=""; $("#ghSetupPass2").value="";
+  $("#ghStatus").textContent = "Paste the new token, pick an email/username and password, then press Sign up. Your saved plans are not affected.";
 };
 
 async function doSetup(){

@@ -147,6 +147,9 @@
   .ghtab{flex:1;border:1px solid var(--line);background:#fff;border-radius:7px;padding:7px 10px;cursor:pointer;font-size:13px;font-weight:600;color:var(--muted)}
   .ghtab:hover{background:#eef3f8}
   .ghtab.active{background:var(--blue-soft);border-color:var(--blue);color:var(--blue)}
+  .recovery{display:flex;flex-direction:column;gap:9px}
+  .recstep{border:1px solid var(--line);border-radius:8px;padding:8px 10px;font-size:12px;line-height:1.5;color:var(--ink)}
+  .recstep b{font-weight:600}
   .toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);background:#12293f;color:#fff;padding:9px 18px;border-radius:8px;font-size:13px;opacity:0;transition:opacity .25s;z-index:200;pointer-events:none}
   .toast.show{opacity:1}
   .toast.undo{pointer-events:auto}
@@ -367,6 +370,21 @@
       <div class="sub" style="margin-bottom:8px">Sign in to sync your plans on this device. No token needed — just the email or username and password from when you signed up.</div>
       <div class="field" style="margin-bottom:8px"><label>Email or username</label><input id="ghUnlockId" autocomplete="username" placeholder="you@example.com"></div>
       <div class="field" style="margin-bottom:8px"><label>Password</label><input type="password" id="ghUnlockPass" autocomplete="current-password" placeholder="Password"></div>
+      <div class="sub"><a href="#" id="ghForgotLink">Forgot your password, or not sure which email/username?</a></div>
+    </div>
+
+    <div id="ghRecoverView" style="display:none">
+      <div class="sub" style="margin-bottom:8px">Your password can't be looked up — it never leaves your browser, and the saved login is encrypted with it. Here's how to get back in:</div>
+      <div class="recovery">
+        <div class="recstep"><b>1. On a device where sync still says “Cloud: on”</b> — the easiest fix. That browser still holds your token, so it can set a brand-new password without knowing the old one. Open Cloud there and click <b>Reset password</b>.
+          <div style="margin-top:6px"><button class="btn small" id="btnGhResetHere">Reset password on this device</button> <span class="hint" id="ghResetHint"></span></div>
+        </div>
+        <div class="recstep"><b>2. No device is signed in any more</b> — make a fresh GitHub token and sign up again. Your saved plans are untouched by this.
+          <div style="margin-top:6px"><a class="btn small" href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener">Create a new token ↗</a> <button class="btn small" id="btnGhToSignup">Then sign up again</button></div>
+          <div class="hint" style="margin-top:4px">Fine-grained token · Repository access: <b>shipsplit</b> and <b>shipsplit-data</b> · Permissions → Contents: <b>Read and write</b>.</div>
+        </div>
+        <div class="recstep"><b>3. You only need the plans, not syncing</b> — close this, click <b>Backup all plans</b> on a device that has them, then <b>Restore backup</b> on the new one. No password or token involved.</div>
+      </div>
     </div>
 
     <div id="ghSetupView" style="display:none">
@@ -381,7 +399,9 @@
 
     <div id="ghConnectedView" style="display:none">
       <div class="sub">Cloud sync is on. Plans sync automatically across your devices.</div>
-      <div style="margin-top:10px"><a href="#" id="ghChangeLink" style="font-size:12px">Change password or token</a></div>
+      <div class="sub" style="margin-top:8px">This device holds your token, so it can set a new sync password without the old one.</div>
+      <div style="margin-top:8px"><button class="btn small" id="btnGhResetPass">Reset password</button></div>
+      <div style="margin-top:8px"><a href="#" id="ghChangeLink" style="font-size:12px">Change password or token (advanced)</a></div>
     </div>
 
     <div id="ghAdvancedView" style="display:none">
