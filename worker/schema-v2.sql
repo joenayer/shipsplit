@@ -509,3 +509,33 @@ INSERT OR IGNORE INTO charge_codes (code, label, cost_class, default_allocation,
   ('lastMile',  'Last mile / delivery', 'freight',  'weight', 1),
   ('storage',   'Storage / demurrage',  'penalty',  'volume', 1),
   ('other',     'Other',                'other',    'weight', 1);
+
+/* ---------------------------------------------------------------------------
+   7. Attachments — invoices, labels, packing lists, anything worth keeping
+   ---------------------------------------------------------------------------
+   The bytes live in R2 (object storage); this table holds only metadata and the object key, because
+   blobs in a relational database make every query slower and every backup bigger. entity_type +
+   entity_id means the same table serves shipments today and POs, SKUs or invoices later without a
+   migration. sha256 is stored so a re-upload of the same document can be recognised rather than
+   silently duplicated. */
+CREATE TABLE IF NOT EXISTS attachments (
+  id            TEXT PRIMARY KEY,
+  org_id        TEXT NOT NULL,
+  entity_type   TEXT NOT NULL,              -- 'shipments' | 'invoices' | 'purchase_orders' | 'skus'
+  entity_id     TEXT NOT NULL,
+  plan_id       TEXT REFERENCES plans(id),  -- convenience for cleanup + ownership checks
+  kind          TEXT NOT NULL DEFAULT 'other',  -- invoice | label | packing_list | bol |
+                                                -- customs_doc | photo | quote | other
+  file_name     TEXT NOT NULL,
+  content_type  TEXT,
+  size_bytes    INTEGER,
+  sha256        TEXT,
+  r2_key        TEXT NOT NULL,              -- object key in the bucket
+  uploaded_by   TEXT REFERENCES users(id),
+  notes         TEXT,
+  source_app    TEXT, source_ref TEXT,
+  created_at    INTEGER NOT NULL, updated_at INTEGER NOT NULL, deleted_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS ix_attach_entity ON attachments (org_id, entity_type, entity_id);
+CREATE INDEX IF NOT EXISTS ix_attach_plan ON attachments (org_id, plan_id);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_attach_key ON attachments (r2_key);

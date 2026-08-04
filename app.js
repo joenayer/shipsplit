@@ -87,7 +87,11 @@ const REF_TYPES = {
   "container":"Container #",
   "fba":"FBA shipment ID",
   "booking":"Booking / BOL #",
+  "po":"PO / order #",                 // e.g. BN PO 02263878
+  "quote":"Quote ID",                  // e.g. FedEx Quote ID 33219096
+  "pickup":"Pickup confirmation #",    // e.g. SGNA2245
   "invoice":"Invoice / receipt",
+  "customs":"Customs entry #",
   "other":"Other"
 };
 /* transient, in-memory only: which bucket ids have their tracking <details> open right now (not persisted, not saved) */
@@ -113,7 +117,10 @@ function normalizePlan(s){
     if(!b.allocations || typeof b.allocations!=="object") b.allocations = {};
     if(!Array.isArray(b.refs)) b.refs = [];
     if(!b.invoice || typeof b.invoice!=="object") b.invoice = blankInvoice();
-    if(!b.invoice.lines || typeof b.invoice.lines!=="object") b.invoice.lines = {};
+    migrateInvoice(b.invoice);
+    if(b.estCustoms==null) b.estCustoms = "";
+    if(b.estDuty==null) b.estDuty = "";
+    if(!Array.isArray(b.files)) b.files = [];
   });
   return out;
 }
@@ -140,16 +147,98 @@ const INVOICE_LINES = {
   other:     "Other",
 };
 const INVOICE_STATUS = { awaiting:"Awaiting invoice", received:"Invoice received", disputed:"Disputed", paid:"Paid" };
-function blankInvoice(){
-  return { number:"", date:"", currency:"USD", amount:"", lines:{}, status:"awaiting", paidDate:"", notes:"" };
+/* attachments: what a shipment document usually is, so it can be filtered later */
+const FILE_KINDS = {
+  invoice:"Invoice", label:"Shipping label", packing_list:"Packing list", bol:"BOL / AWB",
+  customs_doc:"Customs doc", quote:"Quote", photo:"Photo", other:"Other",
+};
+/* files live server-side; this is just what the API last told us, keyed by shipment client id */
+let shipmentFiles = {};
+const openFiles = new Set();
+/* The documents feature talks to the ShipSplit API (Worker + R2), which is separate from the GitHub
+   plan sync. Until an API base is configured the panel still renders — it just explains that uploads
+   need the backend, rather than failing silently on click. */
+const API_KEY = "shipsplit-api-base";
+function apiBase(){ try { return (localStorage.getItem(API_KEY)||"").replace(/\/+$/,""); } catch(e){ return ""; } }
+function setApiBase(url){ try { localStorage.setItem(API_KEY, String(url||"").trim().replace(/\/+$/,"")); } catch(e){} }
+function cloudOn(){ return !!apiBase(); }
+async function apiFetch(path, opts){
+  const base = apiBase();
+  if(!base) throw new Error("no-api");
+  return fetch(base+path, Object.assign({credentials:"include"}, opts||{}));
 }
-function invOf(b){ if(!b.invoice) b.invoice = blankInvoice(); if(!b.invoice.lines) b.invoice.lines = {}; return b.invoice; }
+/* Refresh the document list for the current plan. Failures are non-fatal: documents are an extra,
+   and a plan must still be usable when the API is unreachable. */
+async function loadFiles(){
+  if(!cloudOn() || !state.planName) return;
+  try {
+    const res = await apiFetch("/files?plan="+encodeURIComponent(state.planName));
+    if(!res.ok) return;
+    const data = await res.json();
+    const byShipment = {};
+    (data.files||[]).forEach(f=>{ (byShipment[f.shipmentId] = byShipment[f.shipmentId] || []).push(f); });
+    shipmentFiles = byShipment;
+    renderBuckets();
+  } catch(e){ /* offline or not deployed yet */ }
+}
+async function uploadFiles(bucketId, fileList){
+  if(!cloudOn()){ toast("Set the API address in Cloud settings to store documents."); return; }
+  if(!state.planName){ toast("Save the plan first, then attach documents to it."); return; }
+  const kindSel = document.querySelector('select[data-filekind="'+bucketId+'"]');
+  const kind = kindSel ? kindSel.value : "other";
+  for(const file of fileList){
+    if(file.size > 25*1024*1024){ toast('"'+file.name+'" is larger than 25 MB.'); continue; }
+    try {
+      const res = await apiFetch("/plans/"+encodeURIComponent(state.planName)+"/files/"+encodeURIComponent(bucketId)
+        + "?name="+encodeURIComponent(file.name)+"&kind="+encodeURIComponent(kind),
+        { method:"POST", headers:{"Content-Type": file.type || "application/octet-stream"}, body:file });
+      if(!res.ok){ const e=await res.json().catch(()=>({})); toast(e.error||("Upload failed for "+file.name)); continue; }
+      toast('Attached "'+file.name+'"');
+    } catch(err){ toast("Could not reach the server to upload "+file.name); }
+  }
+  openFiles.add(bucketId);
+  await loadFiles();
+}
+function filesFor(bid){ return (shipmentFiles[bid] || []); }
+function humanSize(n){
+  if(!isFinite(n)||n<=0) return "";
+  if(n < 1024) return n+" B";
+  if(n < 1024*1024) return (n/1024).toFixed(0)+" KB";
+  return (n/1024/1024).toFixed(1)+" MB";
+}
+function blankInvoice(){
+  return { number:"", date:"", currency:"USD", amount:"", charges:[], status:"awaiting", paidDate:"", notes:"" };
+}
+/* Older saved plans stored charges as a fixed object of every possible fee. Charges are now a list
+   you add to, so only fees that actually appear on the invoice are shown. Convert on load. */
+function migrateInvoice(inv){
+  if(!Array.isArray(inv.charges)) inv.charges = [];
+  if(inv.lines && typeof inv.lines==="object"){
+    Object.keys(inv.lines).forEach(code=>{
+      const v = inv.lines[code];
+      if(v!=="" && v!=null && Number(v)!==0 && !inv.charges.some(c=>c.code===code)){
+        inv.charges.push({code, amount:String(v), note:""});
+      }
+    });
+    delete inv.lines;
+  }
+  return inv;
+}
+function invOf(b){ if(!b.invoice) b.invoice = blankInvoice(); migrateInvoice(b.invoice); return b.invoice; }
 /* Sum of the itemised charges. Used to cross-check the all-in figure, never to silently replace it —
    a forwarder's total is the number you actually pay. */
 function invoiceLineTotal(b){
-  const L = invOf(b).lines || {};
-  return Object.keys(INVOICE_LINES).reduce((s,k)=>s+(Number(L[k])||0),0);
+  return invOf(b).charges.reduce((s,c)=>s+(Number(c.amount)||0),0);
 }
+/* ---- the estimate side ----
+   The forwarder quotes freight; customs and duty arrive separately and are usually the part that
+   surprises you. Keeping them as their own estimate means the variance compares like with like
+   instead of blaming freight for a duty bill nobody forecast. */
+function estParts(b){
+  const q = Number(b.quote)||0, c = Number(b.estCustoms)||0, d = Number(b.estDuty)||0;
+  return { freight:q, customs:c, duty:d, total:q+c+d, any:(b.quote!==""&&b.quote!=null)||c>0||d>0 };
+}
+function estimatedTotal(b){ const e = estParts(b); return e.total>0 ? e.total : null; }
 /* The billed figure: the all-in amount if entered, otherwise the itemised lines. null = not invoiced. */
 function invoiceActual(b){
   const inv = invOf(b);
@@ -160,7 +249,7 @@ function invoiceActual(b){
 }
 /* Estimate vs actual for one shipment. null when either side is missing — no fake zeros. */
 function invoiceVariance(b){
-  const q = b.quote!=="" && b.quote!=null ? Number(b.quote) : null;
+  const q = estimatedTotal(b);
   const a = invoiceActual(b);
   if(q==null || !isFinite(q) || q<=0 || a==null) return null;
   return { quote:q, actual:a, delta:a-q, pct:((a-q)/q)*100 };
@@ -1095,8 +1184,11 @@ function renderBucketsInner(){
         <div class="field"><label>Destination type</label>
           <select data-bdest="${b.id}">${Object.keys(DEST_TYPES).map(d=>`<option value="${d}" ${d===b.destType?"selected":""}>${DEST_TYPES[d]}</option>`).join("")}</select></div>
         <div class="field wide"><label>Ship to (name / address / FC code)</label><input data-bshipto="${b.id}" value="${escAttr(b.shipTo||"")}" placeholder="e.g. AWD IUSP, or 3PL address"></div>
-        <div class="field"><label>Quote (USD, all-in)</label><input type="number" data-bquote="${b.id}" value="${escAttr(b.quote||"")}" placeholder="from forwarder"></div>
+        <div class="field"><label>Freight quote (USD)</label><input type="number" data-bquote="${b.id}" value="${escAttr(b.quote||"")}" placeholder="from forwarder"></div>
         <div class="field"><label>Transit days (door to door)</label><input type="number" data-btransit="${b.id}" value="${escAttr(b.transit||"")}" placeholder="e.g. 38"></div>
+        <div class="field"><label>Est. customs (USD)</label><input type="number" step="0.01" data-bestcustoms="${b.id}" value="${escAttr(b.estCustoms||"")}" placeholder="clearance"></div>
+        <div class="field"><label>Est. duty / tariffs (USD)</label><input type="number" step="0.01" data-bestduty="${b.id}" value="${escAttr(b.estDuty||"")}" placeholder="expected"></div>
+        ${(()=>{ const e=estParts(b); return (e.customs||e.duty) ? `<div class="esttotal">Estimated total <b>${fmt$(e.total)}</b> <span class="hint">freight ${fmt$(e.freight)} + customs ${fmt$(e.customs)} + duty ${fmt$(e.duty)}</span></div>` : ""; })()}
       </div>
       <div class="alloc">
         ${allocRows ? `<table><thead><tr><th>Product</th><th class="num">Cases</th><th class="num">Units</th><th class="num">${weightUnitLabel().toUpperCase()}</th><th class="num">${volUnitLabel()}</th><th></th></tr></thead><tbody>${allocRows}</tbody></table>` : `<div class="dropzone-empty">Drag a product here, or add a new one below</div>`}
@@ -1106,7 +1198,7 @@ function renderBucketsInner(){
         const inv = invOf(b), v = invoiceVariance(b), lt = invoiceLineTotal(b), amt = Number(inv.amount)||0;
         const mismatch = inv.amount!=="" && lt>0 && Math.abs(lt-amt) > 0.5;
         return `<details class="invoice" data-invid="${b.id}" ${openInvoices.has(b.id)?"open":""}>
-        <summary>Final invoice${v?` <span class="varchip ${varianceClass(v.pct)}">${varianceText(v)} vs quote</span>`:inv.status!=="awaiting"?` <span class="varchip even">${INVOICE_STATUS[inv.status]}</span>`:""}</summary>
+        <summary>Final invoice${v?` <span class="varchip ${varianceClass(v.pct)}">${varianceText(v)} vs estimate</span>`:inv.status!=="awaiting"?` <span class="varchip even">${INVOICE_STATUS[inv.status]}</span>`:""}</summary>
         <div class="invfields">
           <div class="field"><label>Invoice status</label>
             <select data-invstatus="${b.id}">${Object.keys(INVOICE_STATUS).map(s=>`<option value="${s}" ${s===inv.status?"selected":""}>${INVOICE_STATUS[s]}</option>`).join("")}</select></div>
@@ -1116,14 +1208,41 @@ function renderBucketsInner(){
           <div class="field"><label>Date paid</label><input type="date" data-invpaid="${b.id}" value="${escAttr(inv.paidDate||"")}"></div>
         </div>
         <div class="invlines">
-          <label class="invlbl">Charge breakdown (optional — powers true landed cost)</label>
-          <div class="invgrid">
-            ${Object.keys(INVOICE_LINES).map(k=>`<div class="field"><label>${INVOICE_LINES[k]}</label><input type="number" step="0.01" data-invline="${b.id}|${k}" value="${escAttr((inv.lines||{})[k]||"")}" placeholder="0"></div>`).join("")}
-          </div>
-          ${lt>0?`<div class="invsum${mismatch?" mismatch":""}">Lines total ${fmt$(lt)}${inv.amount!==""?` · all-in ${fmt$(amt)}${mismatch?` · differs by ${fmt$(Math.abs(lt-amt))}`:" · matches"}`:""}</div>`:""}
+          <label class="invlbl">Charges on this invoice</label>
+          ${inv.charges.length ? inv.charges.map((c,i)=>`<div class="chargerow">
+            <select data-chargecode="${b.id}|${i}">${Object.keys(INVOICE_LINES).map(k=>`<option value="${k}" ${k===c.code?"selected":""}>${INVOICE_LINES[k]}</option>`).join("")}</select>
+            <input type="number" step="0.01" data-chargeamt="${b.id}|${i}" value="${escAttr(c.amount||"")}" placeholder="0.00">
+            <button class="rm" title="Remove this charge" aria-label="Remove this charge" data-rmcharge="${b.id}|${i}">✕</button>
+          </div>`).join("") : `<div class="hint" style="padding:2px 0 6px">No charges itemised. Add the ones that appear on the invoice.</div>`}
+          <button class="btn small" data-addcharge="${b.id}">+ Add fee</button>
+          ${lt>0?`<div class="invsum${mismatch?" mismatch":""}">Charges total ${fmt$(lt)}${inv.amount!==""?` · all-in ${fmt$(amt)}${mismatch?` · differs by ${fmt$(Math.abs(lt-amt))}`:" · matches"}`:""}</div>`:""}
         </div>
         <div class="field wide"><label>Invoice notes</label><input data-invnotes="${b.id}" value="${escAttr(inv.notes||"")}" placeholder="e.g. 3 days demurrage at Ningbo"></div>
-        ${v?`<div class="invcompare"><span>Quoted <b>${fmt$(v.quote)}</b></span><span>Billed <b>${fmt$(v.actual)}</b></span><span class="varchip ${varianceClass(v.pct)}">${varianceText(v)}</span>${t.units?`<span class="hint">${fmt(v.actual/t.units,3)} $/unit actual</span>`:""}</div>`:""}
+        ${v?(()=>{ const e=estParts(b); return `<div class="invcompare">
+          <span>Estimated <b>${fmt$(v.quote)}</b>${(e.customs||e.duty)?`<span class="hint"> (incl. customs + duty)</span>`:""}</span>
+          <span>Billed <b>${fmt$(v.actual)}</b></span>
+          <span class="varchip ${varianceClass(v.pct)}">${varianceText(v)}</span>
+          ${t.units?`<span class="hint">${fmt(v.actual/t.units,3)} $/unit actual</span>`:""}
+        </div>`; })():""}
+      </details>`;
+      })()}
+      ${(()=>{
+        const list = filesFor(b.id);
+        return `<details class="files-panel" data-filesid="${b.id}" ${openFiles.has(b.id)?"open":""}>
+        <summary>Documents${list.length?` <span class="varchip even">${list.length}</span>`:""}</summary>
+        <div class="files">
+          ${list.map(f=>`<div class="filerow">
+            <span class="filekind">${FILE_KINDS[f.kind]||f.kind}</span>
+            <a class="fname" href="#" data-dlfile="${escAttr(f.id)}" title="${escAttr(f.fileName)}">${esc(f.fileName)}</a>
+            <span class="fmeta">${humanSize(f.size)}</span>
+            <button class="rm" title="Remove document" aria-label="Remove document" data-rmfile="${escAttr(f.id)}|${b.id}">✕</button>
+          </div>`).join("")}
+          <div class="field"><label>Type of document</label>
+            <select data-filekind="${b.id}">${Object.keys(FILE_KINDS).map(k=>`<option value="${k}">${FILE_KINDS[k]}</option>`).join("")}</select></div>
+          <div class="filedrop" data-filedrop="${b.id}">Drop a file here, or click to choose — invoice, label, packing list, anything worth keeping</div>
+          <input type="file" data-fileinput="${b.id}" style="display:none" multiple>
+          ${cloudOn() ? "" : `<div class="hint" style="margin-top:6px">Documents upload once cloud sync is switched on.</div>`}
+        </div>
       </details>`;
       })()}
       <details class="tracking" data-trackid="${b.id}" ${openTracking.has(b.id)?"open":""}>
@@ -1684,7 +1803,9 @@ document.addEventListener("input", e=>{
   if(t.dataset.invnum){ const b2=bucketOf(t.dataset.invnum); if(b2) invOf(b2).number=t.value; }
   if(t.dataset.invnotes){ const b2=bucketOf(t.dataset.invnotes); if(b2) invOf(b2).notes=t.value; }
   if(t.dataset.invamt){ const b2=bucketOf(t.dataset.invamt); if(b2) invOf(b2).amount=t.value; }
-  if(t.dataset.invline){ const [bid,k]=t.dataset.invline.split("|"); const b2=bucketOf(bid); if(b2) invOf(b2).lines[k]=t.value; }
+  if(t.dataset.chargeamt){ const [bid,i]=t.dataset.chargeamt.split("|"); const b2=bucketOf(bid); const c=b2&&invOf(b2).charges[+i]; if(c) c.amount=t.value; }
+  if(t.dataset.bestcustoms){ const b2=bucketOf(t.dataset.bestcustoms); if(b2) b2.estCustoms=t.value; }
+  if(t.dataset.bestduty){ const b2=bucketOf(t.dataset.bestduty); if(b2) b2.estDuty=t.value; }
   if(t.dataset.btransit){ const bt=bucketOf(t.dataset.btransit); if(bt) bt.transit=t.value; }
   /* text fields inside the tracking <details>: just update state on every keystroke, no re-render (would collapse the details / steal focus); a full re-render happens on "change" (blur/commit) below */
   if(t.dataset.bcarrier){ const b=bucketOf(t.dataset.bcarrier); if(b) b.carrier=t.value; }
@@ -1722,7 +1843,9 @@ document.addEventListener("change", e=>{
      grid's innerHTML — otherwise that next field is destroyed under them mid-typing. */
   if(t.dataset.bquote){ const bq=bucketOf(t.dataset.bquote); if(bq) bq.quote=t.value; setTimeout(refreshTotalsSafely,0); }
   if(t.dataset.invamt){ const b2=bucketOf(t.dataset.invamt); if(b2) invOf(b2).amount=t.value; setTimeout(refreshTotalsSafely,0); }
-  if(t.dataset.invline){ const [bid,k]=t.dataset.invline.split("|"); const b2=bucketOf(bid); if(b2) invOf(b2).lines[k]=t.value; setTimeout(refreshTotalsSafely,0); }
+  if(t.dataset.chargeamt){ const [bid,i]=t.dataset.chargeamt.split("|"); const b2=bucketOf(bid); const c=b2&&invOf(b2).charges[+i]; if(c) c.amount=t.value; setTimeout(refreshTotalsSafely,0); }
+  if(t.dataset.chargecode){ const [bid,i]=t.dataset.chargecode.split("|"); const b2=bucketOf(bid); const c=b2&&invOf(b2).charges[+i]; if(c){ c.code=t.value; openInvoices.add(bid); renderBuckets(); renderSummary(); } }
+  if(t.dataset.bestcustoms || t.dataset.bestduty){ setTimeout(refreshTotalsSafely,0); }
   if(t.dataset.invstatus){ const b2=bucketOf(t.dataset.invstatus); if(b2){ invOf(b2).status=t.value; openInvoices.add(b2.id); renderBuckets(); renderSummary(); } }
   if(t.dataset.invdate){ const b2=bucketOf(t.dataset.invdate); if(b2) invOf(b2).date=t.value; }
   if(t.dataset.invpaid){ const b2=bucketOf(t.dataset.invpaid); if(b2) invOf(b2).paidDate=t.value; }
@@ -1775,7 +1898,11 @@ document.addEventListener("change", e=>{
         dim = vals.join("x");
       }
       p.cartons.forEach(c=>c.dim=dim);
-      // don't re-render the product list here (would break tabbing L->W->H); refresh dependent views only
+      /* Don't re-render the product list here — that would destroy the input mid-tab (L -> W -> H).
+         But the card's own case/unit/weight/volume line is derived from the cases we just changed,
+         so refresh it in place; otherwise it keeps showing the pre-edit CBM until something else
+         happens to redraw, which reads as "my change didn't apply". */
+      refreshProductMeta(p);
       renderBuckets(); renderSummary();
     }
   }
@@ -1846,6 +1973,46 @@ document.addEventListener("click", e=>{
     const b = bucketOf(t.dataset.addref);
     if(b){ if(!b.refs) b.refs=[]; b.refs.push({type:"tracking", value:""}); openTracking.add(b.id); renderBuckets(); }
   }
+  if(t.dataset.filedrop){
+    const inp = document.querySelector('input[data-fileinput="'+t.dataset.filedrop+'"]');
+    if(inp) inp.click();
+  }
+  if(t.dataset.dlfile){
+    e.preventDefault();
+    if(!cloudOn()){ toast("Set the API address in Cloud settings to open documents."); return; }
+    // fetched rather than linked so the session cookie is sent and the response stays a download
+    apiFetch("/files/"+encodeURIComponent(t.dataset.dlfile)).then(async res=>{
+      if(!res.ok){ toast("Could not download that document."); return; }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a2 = document.createElement("a");
+      a2.href = url; a2.download = t.textContent || "document";
+      document.body.appendChild(a2); a2.click(); a2.remove();
+      setTimeout(()=>URL.revokeObjectURL(url), 10000);
+    }).catch(()=>toast("Could not reach the server."));
+  }
+  if(t.dataset.rmfile){
+    const [fid,bid] = t.dataset.rmfile.split("|");
+    apiFetch("/files/"+encodeURIComponent(fid), {method:"DELETE"}).then(async res=>{
+      if(res.ok){ openFiles.add(bid); toast("Document removed"); await loadFiles(); }
+      else toast("Could not remove that document.");
+    }).catch(()=>toast("Could not reach the server."));
+  }
+  if(t.dataset.addcharge){
+    const b=bucketOf(t.dataset.addcharge);
+    if(b){
+      const inv=invOf(b);
+      // offer the next fee they have not used yet, so repeated clicks don't stack duplicates
+      const used=new Set(inv.charges.map(c=>c.code));
+      const next=Object.keys(INVOICE_LINES).find(k=>!used.has(k)) || "other";
+      inv.charges.push({code:next, amount:"", note:""});
+      openInvoices.add(b.id); renderBuckets();
+    }
+  }
+  if(t.dataset.rmcharge){
+    const [bid,i]=t.dataset.rmcharge.split("|"); const b=bucketOf(bid);
+    if(b){ invOf(b).charges.splice(+i,1); openInvoices.add(bid); renderBuckets(); renderSummary(); }
+  }
   if(t.dataset.rmref){
     const [bid,idx] = t.dataset.rmref.split("|");
     const b = bucketOf(bid);
@@ -1853,6 +2020,30 @@ document.addEventListener("click", e=>{
   }
 });
 /* keep track of which shipments' "Tracking and status" panel is open across re-renders (in-memory only, never saved) */
+document.addEventListener("change", e=>{
+  const t = e.target;
+  if(t && t.dataset && t.dataset.fileinput){
+    const bid = t.dataset.fileinput;
+    if(t.files && t.files.length) uploadFiles(bid, [...t.files]);
+    t.value = "";   // let the same file be picked again after a failure
+  }
+}, true);
+/* Drag and drop straight onto the shipment: the common case is dragging a PDF out of an email. */
+document.addEventListener("dragover", e=>{
+  const z = e.target.closest && e.target.closest("[data-filedrop]");
+  if(z){ e.preventDefault(); z.classList.add("over"); }
+});
+document.addEventListener("dragleave", e=>{
+  const z = e.target.closest && e.target.closest("[data-filedrop]");
+  if(z) z.classList.remove("over");
+});
+document.addEventListener("drop", e=>{
+  const z = e.target.closest && e.target.closest("[data-filedrop]");
+  if(!z) return;
+  e.preventDefault(); z.classList.remove("over");
+  const files = e.dataTransfer && e.dataTransfer.files;
+  if(files && files.length) uploadFiles(z.dataset.filedrop, [...files]);
+});
 document.addEventListener("toggle", e=>{
   const el = e.target;
   if(el && el.matches && el.matches("details.tracking")){
@@ -1863,7 +2054,32 @@ document.addEventListener("toggle", e=>{
     const bid = el.dataset.invid;
     if(el.open) openInvoices.add(bid); else openInvoices.delete(bid);
   }
+  if(el && el.matches && el.matches("details.files-panel")){
+    const bid = el.dataset.filesid;
+    if(el.open) openFiles.add(bid); else openFiles.delete(bid);
+  }
 }, true);
+/* Update one product card's derived numbers without rebuilding it, so a focused input survives. */
+function refreshProductMeta(p){
+  const card = document.querySelector('.prod[data-pid="'+p.id+'"]');
+  if(!card) return;
+  const meta = card.querySelector(".meta");
+  if(meta){
+    const units = p.cartons.reduce((s,c)=>s+(c.qty||0),0);
+    const kg    = p.cartons.reduce((s,c)=>s+(c.kg||0),0);
+    const cbm   = p.cartons.reduce((s,c)=>s+cbmOf(c.dim),0);
+    meta.innerHTML = `<span><b>${p.cartons.length}</b> cases</span><span><b>${fmt(units,0)}</b> units</span>`
+      + `<span><b>${fmt(dispKg(kg),0)}</b> ${weightUnitLabel()}</span><span><b>${fmt(dispCbm(cbm),2)}</b> ${volUnitLabel()}</span>`;
+  }
+  // the "mixed" hint next to the size boxes is only true until an edit makes every case the same
+  const dims = p.cartons.map(c=>c.dim).filter(Boolean);
+  const uniform = dims.length>0 && dims.every(d=>d===dims[0]);
+  const row = card.querySelector(".pdimrow");
+  if(row){
+    const hint = row.querySelector(".hint");
+    if(uniform && hint) hint.remove();
+  }
+}
 function bucketOf(id){ return state.buckets.find(b=>b.id===id); }
 function refreshTotalsOnly(){ renderBuckets(); renderSummary(); }
 /* Refresh derived numbers without yanking the DOM out from under someone still typing in the grid.

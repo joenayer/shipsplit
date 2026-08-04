@@ -10,3 +10,8 @@ database_id = "5939066f-6a75-48c5-8bd2-b0d0f53211d1"
 
 [observability]
 enabled = true
+
+# Object storage for shipment attachments (invoices, labels, packing lists). Blobs never go in D1.
+[[r2_buckets]]
+binding = "FILES"
+bucket_name = "shipsplit-files"

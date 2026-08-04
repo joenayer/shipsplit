@@ -175,22 +175,29 @@ export function projectPlan(plan, ctx) {
       }, stamp));
     });
 
-    /* ---- quote ---- */
-    const quoteMinor = toMinor(b.quote);
+    /* ---- estimate: freight quote, plus customs and duty forecast separately ---- */
+    const freightMinor = toMinor(b.quote);
+    const estCustomsMinor = toMinor(b.estCustoms);
+    const estDutyMinor = toMinor(b.estDuty);
+    const quoteMinor = (freightMinor || 0) + (estCustomsMinor || 0) + (estDutyMinor || 0) || null;
     if (quoteMinor != null && quoteMinor > 0) {
       rows.freight_quotes.push(Object.assign({
         id: key("fq", shipId), org_id: orgId, shipment_id: shipId,
         forwarder: b.carrier || null, amount_minor: quoteMinor, currency: "USD",
-        basis: "all_in", rate_micros: null, transit_days: transit, valid_until: null,
+        basis: (estCustomsMinor || estDutyMinor) ? "all_in_with_duty" : "all_in",
+        rate_micros: null, transit_days: transit, valid_until: null,
         is_selected: 1, quoted_at: null, notes: null, source_app: app, source_ref: b.id,
       }, stamp));
     }
 
     /* ---- invoice ---- */
     const inv = b.invoice || {};
-    const lineEntries = CHARGE_CODES
-      .map(code => ({ code, minor: toMinor((inv.lines || {})[code]) }))
-      .filter(x => x.minor != null && x.minor !== 0);
+    /* charges are a list the operator adds to. Older plans stored a fixed object of every possible
+       fee; read either shape so nothing saved before this change is lost. */
+    const rawCharges = Array.isArray(inv.charges)
+      ? inv.charges.map(c => ({ code: c && c.code, minor: toMinor(c && c.amount) }))
+      : CHARGE_CODES.map(code => ({ code, minor: toMinor((inv.lines || {})[code]) }));
+    const lineEntries = rawCharges.filter(x => x.code && x.minor != null && x.minor !== 0);
     const linesTotal = lineEntries.reduce((s, x) => s + x.minor, 0);
     const allIn = toMinor(inv.amount);
     const billed = (allIn != null && allIn > 0) ? allIn : (linesTotal > 0 ? linesTotal : null);
@@ -256,7 +263,14 @@ export function projectPlan(plan, ctx) {
         }, stamp));
       });
     };
-    if (quoteMinor != null && quoteMinor > 0) emit(quoteMinor, true, { freight: quoteMinor });
+    if (quoteMinor != null && quoteMinor > 0) {
+      emit(quoteMinor, true, {
+        freight: freightMinor || 0,
+        duty: estDutyMinor || 0,
+        handling: estCustomsMinor || 0,
+        other: 0,
+      });
+    }
     if (billed != null && billed > 0) {
       // use the itemised split when it exists; otherwise the whole invoice behaves as freight
       const bd = { freight: 0, duty: 0, handling: 0, other: 0 };

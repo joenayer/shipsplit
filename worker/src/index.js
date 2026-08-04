@@ -20,6 +20,16 @@ const MAX_FAILED_EMAIL = 50;        // distributed-guessing backstop; only count
 const MAX_SIGNUPS_PER_IP = 5;       // account creation is unauthenticated and costs a PBKDF2
 const MAX_PLAN_BYTES = 2 * 1024 * 1024;
 const MAX_PLAN_DEPTH = 32;          // plans nest ~5 deep; anything near this is pathological
+const MAX_FILE_BYTES = 25 * 1024 * 1024;   // one invoice/label PDF; well under the Worker body limit
+const FILE_KINDS = ["invoice","label","packing_list","bol","customs_doc","quote","photo","other"];
+/* Served back as an attachment download, never inline, and only for types we recognise. An HTML or
+   SVG file served inline from the API origin would run as script with the session cookie attached. */
+const SAFE_CONTENT_TYPES = [
+  "application/pdf","image/png","image/jpeg","image/gif","image/webp","image/heic",
+  "text/plain","text/csv","application/vnd.ms-excel",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document","application/zip",
+];
 
 /* ---------- small helpers ---------- */
 const enc = new TextEncoder();
@@ -212,6 +222,92 @@ async function reprojectPlan(env, user, planId, planData) {
 async function reprojectSafely(env, user, planId, planData) {
   try { await reprojectPlan(env, user, planId, planData); }
   catch (err) { console.error("projection failed for plan " + planId + ": " + (err && err.stack || err)); }
+}
+
+/* ---------- attachments ----------
+   Bytes go to R2, metadata to D1. Every route re-checks that the plan belongs to the caller, so a
+   guessed id cannot reach another account's documents. */
+function safeName(name) {
+  return String(name || "file").replace(/[\\/\x00-\x1f]/g, "_").replace(/^\.+/, "").slice(0, 200) || "file";
+}
+async function ownedPlan(env, user, planName) {
+  return await env.DB.prepare(
+    "SELECT id FROM plans WHERE user_id = ? AND name = ? AND deleted_at IS NULL"
+  ).bind(user.id, planName).first();
+}
+async function uploadFile(req, env, user, planName, shipmentClientId, origin) {
+  if (!env.FILES) return json({ error: "File storage is not configured." }, 503, origin);
+  const plan = await ownedPlan(env, user, planName);
+  if (!plan) return json({ error: "Plan not found." }, 404, origin);
+
+  const url = new URL(req.url);
+  const fileName = safeName(url.searchParams.get("name"));
+  const kindRaw = url.searchParams.get("kind") || "other";
+  const kind = FILE_KINDS.includes(kindRaw) ? kindRaw : "other";
+  const notes = (url.searchParams.get("notes") || "").slice(0, 500);
+
+  const body = await req.arrayBuffer();
+  if (!body.byteLength) return json({ error: "Empty file." }, 400, origin);
+  if (body.byteLength > MAX_FILE_BYTES) return json({ error: "File is larger than 25 MB." }, 413, origin);
+
+  const declared = (req.headers.get("Content-Type") || "").split(";")[0].trim().toLowerCase();
+  const contentType = SAFE_CONTENT_TYPES.includes(declared) ? declared : "application/octet-stream";
+  const digest = b64(await crypto.subtle.digest("SHA-256", body));
+
+  const orgId = await ensureOrg(env, user);
+  const id = uid();
+  const r2Key = orgId + "/" + plan.id + "/" + (shipmentClientId || "plan") + "/" + id + "-" + fileName;
+  await env.FILES.put(r2Key, body, { httpMetadata: { contentType } });
+
+  const t = now();
+  await env.DB.prepare(
+    "INSERT INTO attachments (id,org_id,entity_type,entity_id,plan_id,kind,file_name,content_type,size_bytes,sha256,r2_key,uploaded_by,notes,source_app,source_ref,created_at,updated_at,deleted_at)" +
+    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL)"
+  ).bind(id, orgId, "shipments", shipmentClientId || "", plan.id, kind, fileName, contentType,
+         body.byteLength, digest, r2Key, user.id, notes, "shipsplit", shipmentClientId || "", t, t).run();
+
+  return json({ id, fileName, kind, contentType, size: body.byteLength, shipmentId: shipmentClientId }, 200, origin);
+}
+async function listFiles(env, user, planName, origin) {
+  const plan = await ownedPlan(env, user, planName);
+  if (!plan) return json({ error: "Plan not found." }, 404, origin);
+  const { results } = await env.DB.prepare(
+    "SELECT id, entity_id AS shipmentId, kind, file_name AS fileName, content_type AS contentType," +
+    " size_bytes AS size, notes, created_at AS uploadedAt FROM attachments" +
+    " WHERE plan_id = ? AND deleted_at IS NULL ORDER BY created_at DESC"
+  ).bind(plan.id).all();
+  return json({ files: results || [] }, 200, origin);
+}
+async function downloadFile(env, user, fileId, origin) {
+  if (!env.FILES) return json({ error: "File storage is not configured." }, 503, origin);
+  const row = await env.DB.prepare(
+    "SELECT a.* FROM attachments a JOIN plans p ON p.id = a.plan_id" +
+    " WHERE a.id = ? AND p.user_id = ? AND a.deleted_at IS NULL"
+  ).bind(fileId, user.id).first();
+  if (!row) return json({ error: "File not found." }, 404, origin);
+  const obj = await env.FILES.get(row.r2_key);
+  if (!obj) return json({ error: "File is missing from storage." }, 404, origin);
+  return new Response(obj.body, {
+    status: 200,
+    headers: Object.assign({
+      "Content-Type": row.content_type || "application/octet-stream",
+      // always a download: never let an uploaded document render in the API's own origin
+      "Content-Disposition": 'attachment; filename="' + safeName(row.file_name) + '"',
+      "X-Content-Type-Options": "nosniff",
+      "Content-Security-Policy": "default-src 'none'; sandbox",
+      "Cache-Control": "private, no-store",
+    }, corsHeaders(origin)),
+  });
+}
+async function deleteFile(env, user, fileId, origin) {
+  const row = await env.DB.prepare(
+    "SELECT a.id, a.r2_key FROM attachments a JOIN plans p ON p.id = a.plan_id" +
+    " WHERE a.id = ? AND p.user_id = ? AND a.deleted_at IS NULL"
+  ).bind(fileId, user.id).first();
+  if (!row) return json({ error: "File not found." }, 404, origin);
+  await env.DB.prepare("UPDATE attachments SET deleted_at = ? WHERE id = ?").bind(now(), row.id).run();
+  if (env.FILES) { try { await env.FILES.delete(row.r2_key); } catch (e) { /* metadata is already gone */ } }
+  return json({ id: fileId, deleted: true }, 200, origin);
 }
 
 /* ---------- route handlers ---------- */
@@ -496,6 +592,19 @@ export default {
       if (!user) return json({ error: "Not signed in." }, 401, origin);
 
       if (path === "/auth/recovery-codes" && req.method === "POST") return await regenerateCodes(req, env, user, origin);
+      if (path === "/files" && req.method === "GET") {
+        const pn = new URL(req.url).searchParams.get("plan") || "";
+        return await listFiles(env, user, pn, origin);
+      }
+      {
+        const up = path.match(/^\/plans\/([^/]+)\/files\/([^/]+)$/);
+        if (up && req.method === "POST") {
+          return await uploadFile(req, env, user, decodeURIComponent(up[1]), decodeURIComponent(up[2]), origin);
+        }
+        const fm = path.match(/^\/files\/([^/]+)$/);
+        if (fm && req.method === "GET") return await downloadFile(env, user, decodeURIComponent(fm[1]), origin);
+        if (fm && req.method === "DELETE") return await deleteFile(env, user, decodeURIComponent(fm[1]), origin);
+      }
       if (path === "/plans" && req.method === "GET") return await listPlans(env, user, origin);
       if (path === "/plans/sync" && req.method === "POST") return await syncPlans(req, env, user, origin);
 
