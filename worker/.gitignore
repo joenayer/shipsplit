@@ -1,2 +1,4 @@
 public/
 node_modules/
+# wrangler's local dev state — a local D1/R2 copy plus logs. Never belongs in the repository.
+.wrangler/
