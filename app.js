@@ -92,6 +92,7 @@ const REF_TYPES = {
 };
 /* transient, in-memory only: which bucket ids have their tracking <details> open right now (not persisted, not saved) */
 const openTracking = new Set();
+const openInvoices = new Set();  // keep the invoice panel open across re-renders, same as tracking
 /* transient, in-memory only: which bucket ids are collapsed/minimized to free up screen space (not saved) */
 const collapsedBuckets = new Set();
 /* transient: current text in the product search box (left panel filter) */
@@ -111,6 +112,8 @@ function normalizePlan(s){
   out.buckets.forEach(b=>{
     if(!b.allocations || typeof b.allocations!=="object") b.allocations = {};
     if(!Array.isArray(b.refs)) b.refs = [];
+    if(!b.invoice || typeof b.invoice!=="object") b.invoice = blankInvoice();
+    if(!b.invoice.lines || typeof b.invoice.lines!=="object") b.invoice.lines = {};
   });
   return out;
 }
@@ -120,7 +123,64 @@ function statusLabel(s){ return (STATUS_META[s]||STATUS_META.planned).label; }
 
 /* products: {id, code, name, deadline, cartons:[{n, qty, dim, kg, note}]} */
 /* buckets: {id, label, mode, destType, shipTo, quote, transit, allocations:{prodId:count},
-             status, carrier, refs:[{type,value}], depDate, arrDate} -- all tracking fields optional */
+             status, carrier, refs:[{type,value}], depDate, arrDate, invoice} -- all tracking optional */
+
+/* ---- final invoice ----
+   The quote is what the forwarder promised; the invoice is what they actually billed. Keeping both
+   is the whole point: the gap between them is the only honest input to a landed-cost number. Charges
+   are itemised because "we were $340 over" is not actionable, but "$340 of unplanned demurrage" is. */
+const INVOICE_LINES = {
+  freight:   "Freight",
+  fuel:      "Fuel surcharge",
+  customs:   "Customs clearance",
+  duty:      "Duty / tariffs",
+  brokerage: "Brokerage",
+  lastMile:  "Last mile / delivery",
+  storage:   "Storage / demurrage",
+  other:     "Other",
+};
+const INVOICE_STATUS = { awaiting:"Awaiting invoice", received:"Invoice received", disputed:"Disputed", paid:"Paid" };
+function blankInvoice(){
+  return { number:"", date:"", currency:"USD", amount:"", lines:{}, status:"awaiting", paidDate:"", notes:"" };
+}
+function invOf(b){ if(!b.invoice) b.invoice = blankInvoice(); if(!b.invoice.lines) b.invoice.lines = {}; return b.invoice; }
+/* Sum of the itemised charges. Used to cross-check the all-in figure, never to silently replace it —
+   a forwarder's total is the number you actually pay. */
+function invoiceLineTotal(b){
+  const L = invOf(b).lines || {};
+  return Object.keys(INVOICE_LINES).reduce((s,k)=>s+(Number(L[k])||0),0);
+}
+/* The billed figure: the all-in amount if entered, otherwise the itemised lines. null = not invoiced. */
+function invoiceActual(b){
+  const inv = invOf(b);
+  const amt = Number(inv.amount);
+  if(inv.amount!=="" && isFinite(amt) && amt>0) return amt;
+  const lt = invoiceLineTotal(b);
+  return lt>0 ? lt : null;
+}
+/* Estimate vs actual for one shipment. null when either side is missing — no fake zeros. */
+function invoiceVariance(b){
+  const q = b.quote!=="" && b.quote!=null ? Number(b.quote) : null;
+  const a = invoiceActual(b);
+  if(q==null || !isFinite(q) || q<=0 || a==null) return null;
+  return { quote:q, actual:a, delta:a-q, pct:((a-q)/q)*100 };
+}
+/* Same across every shipment in the plan, so the plan-level number only counts shipments that have
+   BOTH a quote and an invoice — mixing invoiced and un-invoiced legs would understate the variance. */
+function planVariance(){
+  let quote=0, actual=0, n=0, pending=0;
+  state.buckets.forEach(b=>{
+    const v = invoiceVariance(b);
+    if(v){ quote+=v.quote; actual+=v.actual; n++; }
+    else if(invoiceActual(b)==null && bStatus(b)!=="planned") pending++;
+  });
+  return n ? { quote, actual, delta:actual-quote, pct:((actual-quote)/quote)*100, n, pending } : { n:0, pending };
+}
+function varianceClass(pct){ return pct>0.5 ? "over" : pct<-0.5 ? "under" : "even"; }
+function varianceText(v){
+  const sign = v.delta>0 ? "+" : v.delta<0 ? "−" : "";
+  return sign+fmt$(Math.abs(v.delta))+" ("+sign+fmt(Math.abs(v.pct),1)+"%)";
+}
 
 /* ---- derived ---- */
 function allocatedCount(p){ return state.buckets.reduce((s,b)=>s+(b.allocations[p.id]||0),0); }
@@ -1042,6 +1102,30 @@ function renderBucketsInner(){
         ${allocRows ? `<table><thead><tr><th>Product</th><th class="num">Cases</th><th class="num">Units</th><th class="num">${weightUnitLabel().toUpperCase()}</th><th class="num">${volUnitLabel()}</th><th></th></tr></thead><tbody>${allocRows}</tbody></table>` : `<div class="dropzone-empty">Drag a product here, or add a new one below</div>`}
         <div style="padding:6px 0 2px"><button class="btn small" data-addprodto="${b.id}">+ New product to this shipment</button></div>
       </div>
+      ${(()=>{
+        const inv = invOf(b), v = invoiceVariance(b), lt = invoiceLineTotal(b), amt = Number(inv.amount)||0;
+        const mismatch = inv.amount!=="" && lt>0 && Math.abs(lt-amt) > 0.5;
+        return `<details class="invoice" data-invid="${b.id}" ${openInvoices.has(b.id)?"open":""}>
+        <summary>Final invoice${v?` <span class="varchip ${varianceClass(v.pct)}">${varianceText(v)} vs quote</span>`:inv.status!=="awaiting"?` <span class="varchip even">${INVOICE_STATUS[inv.status]}</span>`:""}</summary>
+        <div class="invfields">
+          <div class="field"><label>Invoice status</label>
+            <select data-invstatus="${b.id}">${Object.keys(INVOICE_STATUS).map(s=>`<option value="${s}" ${s===inv.status?"selected":""}>${INVOICE_STATUS[s]}</option>`).join("")}</select></div>
+          <div class="field"><label>Invoice number</label><input data-invnum="${b.id}" value="${escAttr(inv.number||"")}" placeholder="from forwarder"></div>
+          <div class="field"><label>Invoice date</label><input type="date" data-invdate="${b.id}" value="${escAttr(inv.date||"")}"></div>
+          <div class="field"><label>Final total (${escAttr(inv.currency||"USD")}, all-in)</label><input type="number" step="0.01" data-invamt="${b.id}" value="${escAttr(inv.amount||"")}" placeholder="as billed"></div>
+          <div class="field"><label>Date paid</label><input type="date" data-invpaid="${b.id}" value="${escAttr(inv.paidDate||"")}"></div>
+        </div>
+        <div class="invlines">
+          <label class="invlbl">Charge breakdown (optional — powers true landed cost)</label>
+          <div class="invgrid">
+            ${Object.keys(INVOICE_LINES).map(k=>`<div class="field"><label>${INVOICE_LINES[k]}</label><input type="number" step="0.01" data-invline="${b.id}|${k}" value="${escAttr((inv.lines||{})[k]||"")}" placeholder="0"></div>`).join("")}
+          </div>
+          ${lt>0?`<div class="invsum${mismatch?" mismatch":""}">Lines total ${fmt$(lt)}${inv.amount!==""?` · all-in ${fmt$(amt)}${mismatch?` · differs by ${fmt$(Math.abs(lt-amt))}`:" · matches"}`:""}</div>`:""}
+        </div>
+        <div class="field wide"><label>Invoice notes</label><input data-invnotes="${b.id}" value="${escAttr(inv.notes||"")}" placeholder="e.g. 3 days demurrage at Ningbo"></div>
+        ${v?`<div class="invcompare"><span>Quoted <b>${fmt$(v.quote)}</b></span><span>Billed <b>${fmt$(v.actual)}</b></span><span class="varchip ${varianceClass(v.pct)}">${varianceText(v)}</span>${t.units?`<span class="hint">${fmt(v.actual/t.units,3)} $/unit actual</span>`:""}</div>`:""}
+      </details>`;
+      })()}
       <details class="tracking" data-trackid="${b.id}" ${openTracking.has(b.id)?"open":""}>
         <summary>Tracking and status</summary>
         <div class="trackfields">
@@ -1112,11 +1196,12 @@ function renderSummary(){
     const m = modeAgg[b.mode] || (modeAgg[b.mode]={cases:0,units:0,quote:0,hasQ:false});
     m.cases+=t.cartons; m.units+=t.units; if(q){ m.quote+=q; m.hasQ=true; }
   });
-  let Tc=0,Tu=0,Tk=0,Tv=0,Tq=0, anyQ=false;
+  let Tc=0,Tu=0,Tk=0,Tv=0,Tq=0, anyQ=false, Ta=0, anyA=false;
   const rows = state.buckets.map(b=>{
     const t = bucketTotals(b, slices);
     const q = b.quote?Number(b.quote):null;
     if(q){Tq+=q; anyQ=true;}
+    const act = invoiceActual(b); if(act!=null){ Ta+=act; anyA=true; }
     Tc+=t.cartons;Tu+=t.units;Tk+=t.kg;Tv+=t.cbm;
     const late = bucketLateProducts(b);
     const st = bStatus(b);
@@ -1129,6 +1214,8 @@ function renderSummary(){
       <td class="num">${t.cartons}</td><td class="num">${fmt(t.units,0)}</td>
       <td class="num">${fmt(dispKg(t.kg),0)}</td><td class="num">${fmt(dispCbm(t.cbm),2)}</td>
       <td class="num">${fmt$(q)}</td>
+      <td class="num">${act!=null?fmt$(act):"<span class='hint'>pending</span>"}</td>
+      <td class="num">${(()=>{ const v=invoiceVariance(b); return v?`<span class="varchip ${varianceClass(v.pct)}">${varianceText(v)}</span>`:"-"; })()}</td>
       <td class="num ${isBest?"bestcell":""}"${isBest?' title="Cheapest per unit"':''}>${pu!=null?fmt(pu,3)+(isBest?" ✓":""):"-"}</td>
       <td class="num">${b.transit||"-"}</td>
       <td class="${late.length?"late-cell":""}">${dstr(bucketEta(b))}${late.length?" ⚠":""}${b.arrDate?`<div class="hint">arr ${esc(b.arrDate)}</div>`:""}</td>
@@ -1142,11 +1229,28 @@ function renderSummary(){
     return `<span><b>${MODES[m]}</b>: ${a.cases} cases · ${fmt(a.units,0)} units${a.hasQ?" · "+fmt$(a.quote):""}${blended}</span>`;
   }).join("")}</div>` : "";
   body.innerHTML = `<div style="overflow:auto"><table>
-    <thead><tr><th>Shipment</th><th>Mode</th><th>Destination</th><th>Status</th><th class="num">Cases</th><th class="num">Units</th><th class="num">${weightUnitLabel().toUpperCase()}</th><th class="num">${volUnitLabel()}</th><th class="num">Quote</th><th class="num">$/unit</th><th class="num">Transit</th><th>ETA</th></tr></thead>
+    <thead><tr><th>Shipment</th><th>Mode</th><th>Destination</th><th>Status</th><th class="num">Cases</th><th class="num">Units</th><th class="num">${weightUnitLabel().toUpperCase()}</th><th class="num">${volUnitLabel()}</th><th class="num">Quote</th><th class="num">Billed</th><th class="num">Variance</th><th class="num">$/unit</th><th class="num">Transit</th><th>ETA</th></tr></thead>
     <tbody>${rows}
-    <tr class="total"><td>Total plan</td><td></td><td></td><td></td><td class="num">${Tc}</td><td class="num">${fmt(Tu,0)}</td><td class="num">${fmt(dispKg(Tk),0)}</td><td class="num">${fmt(dispCbm(Tv),2)}</td><td class="num">${anyQ?fmt$(Tq):"-"}</td><td class="num">${anyQ&&Tu?fmt(Tq/Tu,3):"-"}</td><td></td><td></td></tr>
+    <tr class="total"><td>Total plan</td><td></td><td></td><td></td><td class="num">${Tc}</td><td class="num">${fmt(Tu,0)}</td><td class="num">${fmt(dispKg(Tk),0)}</td><td class="num">${fmt(dispCbm(Tv),2)}</td><td class="num">${anyQ?fmt$(Tq):"-"}</td><td class="num">${anyA?fmt$(Ta):"-"}</td><td class="num">${(()=>{
+      const pv=planVariance();
+      if(!pv.n) return "-";
+      /* The Quote column above totals EVERY shipment, but variance can only compare the ones that
+         have both a quote and an invoice. Say so, or the row looks like it cannot do arithmetic. */
+      const partial = pv.n < state.buckets.length;
+      return `<span class="varchip ${varianceClass(pv.pct)}"${partial?` title="Compares the ${pv.n} shipment${pv.n>1?"s":""} that have both a quote and an invoice — not the full plan total to the left"`:""}>${varianceText(pv)}</span>${partial?`<div class="hint" style="font-weight:400">on ${pv.n} of ${state.buckets.length}</div>`:""}`;
+    })()}</td><td class="num">${anyQ&&Tu?fmt(Tq/Tu,3):"-"}</td><td></td><td></td></tr>
     </tbody></table></div>
     ${byMode}
+    ${(()=>{
+      const pv = planVariance();
+      if(!pv.n) return pv.pending ? `<div class="hint" style="margin-top:8px">${pv.pending} shipment${pv.pending>1?"s":""} in progress with no invoice entered yet.</div>` : "";
+      const dir = pv.delta>0 ? "over" : pv.delta<0 ? "under" : "on";
+      return `<div class="varbanner ${varianceClass(pv.pct)}">
+        <b>Estimate vs final invoice</b> — ${pv.n} invoiced shipment${pv.n>1?"s":""}:
+        quoted ${fmt$(pv.quote)}, billed ${fmt$(pv.actual)},
+        <b>${dir==="on"?"on estimate":varianceText(pv)+" "+dir}</b>${pv.pending?` · ${pv.pending} still awaiting an invoice`:""}
+      </div>`;
+    })()}
     ${un>0?`<div class="warnflag" style="margin-top:8px">⚠ ${un} cases are not assigned to any shipment yet.</div>`:""}`;
 }
 
@@ -1577,6 +1681,10 @@ document.addEventListener("input", e=>{
      innerHTML and destroy the very input being typed into (every keystroke after the first was
      lost). Dependent totals refresh on "change" (blur/commit) below. */
   if(t.dataset.bquote){ const bq=bucketOf(t.dataset.bquote); if(bq) bq.quote=t.value; }
+  if(t.dataset.invnum){ const b2=bucketOf(t.dataset.invnum); if(b2) invOf(b2).number=t.value; }
+  if(t.dataset.invnotes){ const b2=bucketOf(t.dataset.invnotes); if(b2) invOf(b2).notes=t.value; }
+  if(t.dataset.invamt){ const b2=bucketOf(t.dataset.invamt); if(b2) invOf(b2).amount=t.value; }
+  if(t.dataset.invline){ const [bid,k]=t.dataset.invline.split("|"); const b2=bucketOf(bid); if(b2) invOf(b2).lines[k]=t.value; }
   if(t.dataset.btransit){ const bt=bucketOf(t.dataset.btransit); if(bt) bt.transit=t.value; }
   /* text fields inside the tracking <details>: just update state on every keystroke, no re-render (would collapse the details / steal focus); a full re-render happens on "change" (blur/commit) below */
   if(t.dataset.bcarrier){ const b=bucketOf(t.dataset.bcarrier); if(b) b.carrier=t.value; }
@@ -1613,6 +1721,12 @@ document.addEventListener("change", e=>{
      browser finishes moving focus to whatever the user tabbed/clicked into BEFORE we replace the
      grid's innerHTML — otherwise that next field is destroyed under them mid-typing. */
   if(t.dataset.bquote){ const bq=bucketOf(t.dataset.bquote); if(bq) bq.quote=t.value; setTimeout(refreshTotalsSafely,0); }
+  if(t.dataset.invamt){ const b2=bucketOf(t.dataset.invamt); if(b2) invOf(b2).amount=t.value; setTimeout(refreshTotalsSafely,0); }
+  if(t.dataset.invline){ const [bid,k]=t.dataset.invline.split("|"); const b2=bucketOf(bid); if(b2) invOf(b2).lines[k]=t.value; setTimeout(refreshTotalsSafely,0); }
+  if(t.dataset.invstatus){ const b2=bucketOf(t.dataset.invstatus); if(b2){ invOf(b2).status=t.value; openInvoices.add(b2.id); renderBuckets(); renderSummary(); } }
+  if(t.dataset.invdate){ const b2=bucketOf(t.dataset.invdate); if(b2) invOf(b2).date=t.value; }
+  if(t.dataset.invpaid){ const b2=bucketOf(t.dataset.invpaid); if(b2) invOf(b2).paidDate=t.value; }
+  if(t.dataset.invnum || t.dataset.invnotes){ setTimeout(refreshTotalsSafely,0); }
   if(t.dataset.btransit){ const bt=bucketOf(t.dataset.btransit); if(bt) bt.transit=t.value; setTimeout(refreshTotalsSafely,0); }
   if(t.dataset.bstatus){ const b=bucketOf(t.dataset.bstatus); if(b){ b.status=t.value; renderBuckets(); renderSummary(); } }
   if(t.dataset.bcarrier){ /* value already applied on input; nothing else depends on it visually */ }
@@ -1688,7 +1802,7 @@ document.addEventListener("click", e=>{
     const bid=t.dataset.delbucket, idx=state.buckets.findIndex(b=>b.id===bid);
     if(idx>=0){
       const removed=state.buckets[idx];
-      state.buckets.splice(idx,1); collapsedBuckets.delete(bid); openTracking.delete(bid); render();
+      state.buckets.splice(idx,1); collapsedBuckets.delete(bid); openTracking.delete(bid); openInvoices.delete(bid); render();
       showUndo('Deleted "'+(removed.label||MODES[removed.mode])+'"', ()=>{ state.buckets.splice(Math.min(idx,state.buckets.length),0,removed); render(); });
     }
   }
@@ -1744,6 +1858,10 @@ document.addEventListener("toggle", e=>{
   if(el && el.matches && el.matches("details.tracking")){
     const bid = el.dataset.trackid;
     if(el.open) openTracking.add(bid); else openTracking.delete(bid);
+  }
+  if(el && el.matches && el.matches("details.invoice")){
+    const bid = el.dataset.invid;
+    if(el.open) openInvoices.add(bid); else openInvoices.delete(bid);
   }
 }, true);
 function bucketOf(id){ return state.buckets.find(b=>b.id===id); }

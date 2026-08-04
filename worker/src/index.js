@@ -5,6 +5,8 @@
    Every response is JSON. Auth is an opaque session cookie; only its SHA-256 is stored. */
 "use strict";
 
+import { projectPlan, PROJECTION_TABLES } from "./project.js";
+
 const ALLOWED_ORIGINS = [
   "https://joenayer.github.io",
   "http://localhost:8788",
@@ -151,6 +153,65 @@ async function noteFailure(env, key) {
 }
 async function clearFailures(env, key) {
   await env.DB.prepare("DELETE FROM login_attempts WHERE key = ?").bind(key).run();
+}
+
+/* ---------- v2 projection ----------
+   Every plan save is also decomposed into the normalised tables (schema-v2.sql) so the data can be
+   queried for landed cost, inventory and quote accuracy. This is strictly a PROJECTION: plans.data
+   remains the source of truth, and a failure here must never cost someone their save — hence the
+   try/catch at the call site. */
+async function ensureOrg(env, user) {
+  const orgId = "org_" + user.id;
+  const row = await env.DB.prepare("SELECT id FROM orgs WHERE id = ?").bind(orgId).first();
+  if (!row) {
+    const t = now();
+    await env.DB.batch([
+      env.DB.prepare("INSERT INTO orgs (id,name,base_currency,weight_unit,volume_unit,created_at,updated_at) VALUES (?,?,?,?,?,?,?)")
+        .bind(orgId, user.email, "USD", "kg", "cbm", t, t),
+      env.DB.prepare("INSERT OR IGNORE INTO org_members (org_id,user_id,role,created_at) VALUES (?,?,?,?)")
+        .bind(orgId, user.id, "owner", t),
+    ]);
+  }
+  return orgId;
+}
+/* Child rows are cleared by walking down from the plan, so a product or shipment deleted in the
+   client disappears here too instead of lingering as a phantom cost. Catalog tables (skus,
+   locations) are deliberately NOT cleared — they outlive any single plan. */
+const REPROJECT_DELETES = [
+  "DELETE FROM landed_costs WHERE shipment_id IN (SELECT id FROM shipments WHERE plan_id = ?)",
+  "DELETE FROM cost_variances WHERE shipment_id IN (SELECT id FROM shipments WHERE plan_id = ?)",
+  "DELETE FROM invoice_lines WHERE invoice_id IN (SELECT id FROM invoices WHERE shipment_id IN (SELECT id FROM shipments WHERE plan_id = ?))",
+  "DELETE FROM invoices WHERE shipment_id IN (SELECT id FROM shipments WHERE plan_id = ?)",
+  "DELETE FROM freight_quotes WHERE shipment_id IN (SELECT id FROM shipments WHERE plan_id = ?)",
+  "DELETE FROM shipment_refs WHERE shipment_id IN (SELECT id FROM shipments WHERE plan_id = ?)",
+  "DELETE FROM shipment_carton_assignments WHERE shipment_id IN (SELECT id FROM shipments WHERE plan_id = ?)",
+  "DELETE FROM shipment_allocations WHERE shipment_id IN (SELECT id FROM shipments WHERE plan_id = ?)",
+  "DELETE FROM cartons WHERE plan_product_id IN (SELECT id FROM plan_products WHERE plan_id = ?)",
+  "DELETE FROM shipments WHERE plan_id = ?",
+  "DELETE FROM plan_products WHERE plan_id = ?",
+  "DELETE FROM plan_versions WHERE plan_id = ?",
+];
+async function reprojectPlan(env, user, planId, planData) {
+  const orgId = await ensureOrg(env, user);
+  const { rows } = projectPlan(planData, { orgId, planId, userId: user.id, at: now(), sourceApp: "shipsplit" });
+  const ops = REPROJECT_DELETES.map(sql => env.DB.prepare(sql).bind(planId));
+  for (const table of PROJECTION_TABLES) {
+    for (const row of rows[table]) {
+      const cols = Object.keys(row);
+      // catalog rows are shared across plans: keep whatever is already there
+      const verb = (table === "skus" || table === "locations") ? "INSERT OR IGNORE" : "INSERT OR REPLACE";
+      ops.push(env.DB.prepare(
+        verb + " INTO " + table + " (" + cols.join(",") + ") VALUES (" + cols.map(() => "?").join(",") + ")"
+      ).bind(...cols.map(c => row[c])));
+    }
+  }
+  await env.DB.batch(ops);
+  return ops.length;
+}
+/* Never let a projection failure surface to the client: the plan itself is already saved. */
+async function reprojectSafely(env, user, planId, planData) {
+  try { await reprojectPlan(env, user, planId, planData); }
+  catch (err) { console.error("projection failed for plan " + planId + ": " + (err && err.stack || err)); }
 }
 
 /* ---------- route handlers ---------- */
@@ -314,6 +375,8 @@ async function putPlan(req, env, user, name, origin) {
   if (!existing) {
     await env.DB.prepare("INSERT INTO plans (id, user_id, name, data, updated_at, deleted_at) VALUES (?,?,?,?,?,NULL)")
       .bind(uid(), user.id, name, serialized, incoming).run();
+    const fresh = await env.DB.prepare("SELECT id FROM plans WHERE user_id = ? AND name = ?").bind(user.id, name).first();
+    if (fresh) await reprojectSafely(env, user, fresh.id, body.data);
     return json({ name, updatedAt: incoming, written: true }, 200, origin);
   }
   /* A deletion is just another timestamped event: an older write must not resurrect it. Previously the
@@ -324,6 +387,7 @@ async function putPlan(req, env, user, name, origin) {
   }
   await env.DB.prepare("UPDATE plans SET data = ?, updated_at = ?, deleted_at = NULL WHERE id = ?")
     .bind(serialized, incoming, existing.id).run();
+  await reprojectSafely(env, user, existing.id, body.data);
   return json({ name, updatedAt: incoming, written: true }, 200, origin);
 }
 async function deletePlan(env, user, name, origin) {
@@ -341,6 +405,7 @@ async function syncPlans(req, env, user, origin) {
   const { results } = await env.DB.prepare("SELECT id, name, data, updated_at, deleted_at FROM plans WHERE user_id = ?").bind(user.id).all();
   const server = new Map((results || []).map(r => [r.name, r]));
   const ops = [];
+  const touched = new Set();   // plans this sync actually wrote, for re-projection below
 
   for (const name of Object.keys(incoming)) {
     const plan = incoming[name];
@@ -354,9 +419,11 @@ async function syncPlans(req, env, user, origin) {
       ops.push(env.DB.prepare("INSERT INTO plans (id,user_id,name,data,updated_at,deleted_at) VALUES (?,?,?,?,?,NULL)")
         .bind(uid(), user.id, name, serialized, ts));
       server.set(name, { name, data: serialized, updated_at: ts, deleted_at: null });
+      touched.add(name);
     } else if (ts > row.updated_at) {
       ops.push(env.DB.prepare("UPDATE plans SET data=?, updated_at=?, deleted_at=NULL WHERE id=?").bind(serialized, ts, row.id));
       row.data = serialized; row.updated_at = ts; row.deleted_at = null;
+      touched.add(name);
     }
   }
   for (const name of Object.keys(deleted)) {
@@ -368,6 +435,16 @@ async function syncPlans(req, env, user, origin) {
     }
   }
   if (ops.length) await env.DB.batch(ops);
+
+  /* Re-project everything the sync actually changed. Done after the batch commits so the projection
+     always reflects what was stored, never what we hoped to store. */
+  for (const name of touched) {
+    const row = server.get(name);
+    if (!row || row.deleted_at) continue;
+    const live = await env.DB.prepare("SELECT id FROM plans WHERE user_id = ? AND name = ?").bind(user.id, name).first();
+    if (!live) continue;
+    try { await reprojectSafely(env, user, live.id, JSON.parse(row.data)); } catch (e) { /* unreadable row */ }
+  }
 
   const out = {}, tomb = {};
   for (const [name, row] of server) {

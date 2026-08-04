@@ -5,8 +5,10 @@ import { readFileSync } from "node:fs";
 import worker from "../src/index.js";
 
 const schema = readFileSync(new URL("../schema.sql", import.meta.url), "utf8");
+const schemaV2 = readFileSync(new URL("../schema-v2.sql", import.meta.url), "utf8");
 const db = new DatabaseSync(":memory:");
 db.exec(schema);
+db.exec(schemaV2);
 
 /* Minimal D1 shim: prepare().bind().first()/run()/all(), plus batch(). */
 function d1(sqlite) {
@@ -276,6 +278,55 @@ ck("session is dead after logout", r.status === 401);
   cookie = "";
   const used = await call("POST", "/auth/recover", { email: "victim@test.com", code: fresh, newPassword: "a replacement password" }, { ip: "203.0.113.30" });
   ck("a regenerated code actually works", used.status === 200);
+}
+
+/* ---------- v2 projection happens on the real write paths ---------- */
+{
+  cookie = "";
+  await call("POST", "/auth/signup", { email: "proj@test.com", password: "a good password" }, { ip: "203.0.113.150" });
+  const plan = {
+    planName: "Proj", po: "091", shipFrom: "Ningbo", readyDate: "2026-07-01", updatedAt: 5000,
+    products: [{ id:"p1", code:"PL-AAA-1", name:"Alpha", deadline:"2026-09-01",
+                 cartons:[{n:1,qty:100,dim:"40x30x20",kg:10},{n:2,qty:100,dim:"40x30x20",kg:10}] }],
+    buckets: [{ id:"b1", label:"Air 1", mode:"air", destType:"awd", shipTo:"IUSF", quote:"1000",
+                transit:"7", allocations:{p1:2}, status:"in-transit", carrier:"Fedex",
+                refs:[{type:"tracking",value:"123"}], depDate:"2026-07-10", arrDate:"",
+                invoice:{ number:"INV-1", date:"2026-07-20", currency:"USD", amount:"1250",
+                          lines:{freight:"1000",storage:"250"}, status:"received", paidDate:"", notes:"" } }],
+  };
+  await call("PUT", "/plans/Proj", { data: plan, updatedAt: 5000 });
+
+  const q = sql => db.prepare(sql).get();
+  ck("PUT projects the plan into v2 tables", q("SELECT COUNT(*) n FROM plan_products").n === 1);
+  ck("PUT projects cartons", q("SELECT COUNT(*) n FROM cartons").n === 2);
+  ck("PUT projects the shipment", q("SELECT COUNT(*) n FROM shipments").n === 1);
+  ck("PUT creates an org for this user on first write",
+    db.prepare("SELECT COUNT(*) n FROM orgs WHERE name='proj@test.com'").get().n === 1);
+  ck("the org has the user as owner",
+    db.prepare("SELECT COUNT(*) n FROM org_members m JOIN users u ON u.id=m.user_id WHERE u.email='proj@test.com' AND m.role='owner'").get().n === 1);
+  ck("each account gets its own org (no cross-tenant mixing)",
+    db.prepare("SELECT COUNT(DISTINCT org_id) n FROM plan_versions").get().n ===
+    db.prepare("SELECT COUNT(DISTINCT user_id) n FROM plans p WHERE EXISTS (SELECT 1 FROM plan_versions v WHERE v.plan_id=p.id)").get().n);
+  ck("PUT projects the SKU into the catalog", q("SELECT COUNT(*) n FROM skus WHERE code='PL-AAA-1'").n === 1);
+  ck("PUT projects the invoice in cents", q("SELECT total_minor m FROM invoices").m === 125000);
+  ck("PUT projects itemised charges", q("SELECT COUNT(*) n FROM invoice_lines").n === 2);
+  ck("PUT computes the variance (+$250)", q("SELECT delta_minor d FROM cost_variances").d === 25000);
+  ck("PUT computes landed cost per unit", q("SELECT unit_cost_minor c FROM landed_costs WHERE is_estimate=0").c === 625);
+
+  // removing a shipment must clear its projected children, not leave phantom costs
+  const plan2 = JSON.parse(JSON.stringify(plan));
+  plan2.buckets = [];
+  await call("PUT", "/plans/Proj", { data: plan2, updatedAt: 6000 });
+  ck("re-projection removes shipments deleted in the client", q("SELECT COUNT(*) n FROM shipments").n === 0);
+  ck("re-projection removes their invoices too", q("SELECT COUNT(*) n FROM invoices").n === 0);
+  ck("re-projection removes their landed costs too", q("SELECT COUNT(*) n FROM landed_costs").n === 0);
+  ck("re-projection keeps the SKU catalog (outlives the plan)", q("SELECT COUNT(*) n FROM skus WHERE code='PL-AAA-1'").n === 1);
+
+  // sync path projects as well
+  const plan3 = JSON.parse(JSON.stringify(plan));
+  plan3.planName = "ViaSync";
+  await call("POST", "/plans/sync", { plans: { ViaSync: Object.assign({}, plan3, {updatedAt: 9000}) }, deleted: {} });
+  ck("sync projects too", db.prepare("SELECT COUNT(*) n FROM shipments").get().n === 1);
 }
 
 console.log(results.join("\n"));
