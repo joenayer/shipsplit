@@ -207,12 +207,38 @@ function humanSize(n){
   return (n/1024/1024).toFixed(1)+" MB";
 }
 function blankInvoice(){
-  return { number:"", date:"", currency:"USD", amount:"", charges:[], status:"awaiting", paidDate:"", notes:"" };
+  return { number:"", date:"", currency:"USD", amount:"", charges:[], status:"awaiting", paidDate:"",
+           notes:"", billedKg:"", billedCbm:"" };
+}
+/* What the carrier actually billed on, which is routinely not what you measured: they reweigh, and
+   air freight bills on volumetric weight when it exceeds actual. Storing it is what makes a $/kg
+   figure real rather than theoretical, and it explains overages that have nothing to do with rates. */
+/* Stored METRIC (kg, cbm) like every other measurement in this file — the unit toggle is a display
+   concern only. Entering 400 lb and switching to kg must not turn it into 400 kg. */
+function billedKgOf(b){
+  const raw = invOf(b).billedKg, v = Number(raw);
+  return (raw!=="" && raw!=null && isFinite(v) && v>0) ? v : null;
+}
+function billedCbmOf(b){
+  const raw = invOf(b).billedCbm, v = Number(raw);
+  return (raw!=="" && raw!=null && isFinite(v) && v>0) ? v : null;
+}
+/* Convert what was typed in the current display unit back to storage. */
+function kgFromInput(val){ const n=Math.max(0,+val||0); return isImperial() ? n/KG2LB : n; }
+function cbmFromInput(val){ const n=Math.max(0,+val||0); return isImperial() ? n/CBM2FT3 : n; }
+/* Weight actually charged vs weight planned, both metric; callers format for display. */
+function weightVariance(b, plannedKgMetric){
+  const billed = billedKgOf(b);
+  if(billed==null || !plannedKgMetric) return null;
+  return { planned:plannedKgMetric, billed, delta:billed-plannedKgMetric,
+           pct:((billed-plannedKgMetric)/plannedKgMetric)*100 };
 }
 /* Older saved plans stored charges as a fixed object of every possible fee. Charges are now a list
    you add to, so only fees that actually appear on the invoice are shown. Convert on load. */
 function migrateInvoice(inv){
   if(!Array.isArray(inv.charges)) inv.charges = [];
+  if(inv.billedKg==null) inv.billedKg = "";
+  if(inv.billedCbm==null) inv.billedCbm = "";
   if(inv.lines && typeof inv.lines==="object"){
     Object.keys(inv.lines).forEach(code=>{
       const v = inv.lines[code];
@@ -1206,7 +1232,17 @@ function renderBucketsInner(){
           <div class="field"><label>Invoice date</label><input type="date" data-invdate="${b.id}" value="${escAttr(inv.date||"")}"></div>
           <div class="field"><label>Final total (${escAttr(inv.currency||"USD")}, all-in)</label><input type="number" step="0.01" data-invamt="${b.id}" value="${escAttr(inv.amount||"")}" placeholder="as billed"></div>
           <div class="field"><label>Date paid</label><input type="date" data-invpaid="${b.id}" value="${escAttr(inv.paidDate||"")}"></div>
+          <div class="field"><label>Billed weight (${weightUnitLabel()})</label><input type="number" step="0.1" data-invkg="${b.id}" value="${escAttr(billedKgOf(b)!=null ? +(dispKg(billedKgOf(b))).toFixed(1) : "")}" placeholder="${escAttr(fmt(dispKg(t.kg),0))} planned"></div>
+          <div class="field"><label>Billed volume (${volUnitLabel()})</label><input type="number" step="0.01" data-invcbm="${b.id}" value="${escAttr(billedCbmOf(b)!=null ? +(dispCbm(billedCbmOf(b))).toFixed(2) : "")}" placeholder="${escAttr(fmt(dispCbm(t.cbm),2))} planned"></div>
         </div>
+        ${(()=>{
+          const wv = weightVariance(b, t.kg);
+          if(!wv) return "";
+          const cls = varianceClass(wv.pct);
+          const sign = wv.delta>0?"+":wv.delta<0?"−":"";
+          const U = weightUnitLabel();
+          return `<div class="invsum${Math.abs(wv.pct)>2?" mismatch":""}">Planned ${fmt(dispKg(wv.planned),0)} ${U} · billed ${fmt(dispKg(wv.billed),0)} ${U} <span class="varchip ${cls}">${sign}${fmt(Math.abs(dispKg(wv.delta)),0)} ${U} (${sign}${fmt(Math.abs(wv.pct),1)}%)</span>${wv.delta>0?' <span class="hint">reweighed or billed on volumetric weight</span>':""}</div>`;
+        })()}
         <div class="invlines">
           <label class="invlbl">Charges on this invoice</label>
           ${inv.charges.length ? inv.charges.map((c,i)=>`<div class="chargerow">
@@ -1280,6 +1316,20 @@ function renderBucketsInner(){
           ${q&&t.cbm?`<span>${fmt(q/dispCbm(t.cbm),0)} $/${volUnitLabel()}</span>`:""}
           ${q&&t.units?`<span><b>${fmt(q/t.units,3)}</b> $/unit</span>`:""}
         </div>
+        ${(()=>{
+          /* Once an invoice exists the rate that matters is the billed one, computed on the weight
+             the carrier actually charged for where that is known. */
+          const act = invoiceActual(b);
+          if(act==null) return "";
+          const kgBasis = dispKg(billedKgOf(b) != null ? billedKgOf(b) : t.kg);
+          const cbmBasis = dispCbm(billedCbmOf(b) != null ? billedCbmOf(b) : t.cbm);
+          return `<div class="totline actualline" style="margin-top:3px">
+            <span>Billed: <b>${fmt$(act)}</b></span>
+            ${kgBasis?`<span>${fmt(act/kgBasis,2)} $/${weightUnitLabel()}</span>`:""}
+            ${cbmBasis?`<span>${fmt(act/cbmBasis,0)} $/${volUnitLabel()}</span>`:""}
+            ${t.units?`<span><b>${fmt(act/t.units,3)}</b> $/unit</span>`:""}
+          </div>`;
+        })()}
         <div class="eta">ETA: <b>${eta?dstr(eta):"set ready date + transit"}</b>${eta&&!late.length?' <span class="ok">on time for all deadlines set</span>':""}</div>
         ${late.length?`<div class="warnflag">⚠ Arrives after need-by date: ${late.map(p=>esc(p.code)).join(", ")}. Consider moving those cases to a faster shipment.</div>`:""}
         <div class="bucket-actions"><button class="btn small" data-savebucket="${b.id}" title="Save the whole plan now so this shipment's changes aren't lost">Save</button><button class="btn small" data-dupbucket="${b.id}" title="Create a copy with the same settings and no cases">Duplicate</button><button class="btn small" data-export="${b.id}">Export packing list</button>${amz?`<button class="btn small amzbtn" data-amzsheet="${b.id}|${amz}" title="Download a case-packed ${amz} inbound upload sheet for this shipment">Export ${amz} sheet</button><a class="btn small amzlink" href="${amazonUploadUrl(amz)}" target="_blank" rel="noopener" title="Open Amazon Seller Central to upload the ${amz} sheet">Open ${amz} upload ↗</a><button class="btn small amzprompt" data-prompt="${b.id}" title="Generate a ready-to-paste prompt for an AI browser extension to create this shipment on Amazon">Create prompt ✨</button>`:""}</div>
@@ -1312,8 +1362,15 @@ function renderSummary(){
     const pu = (q && t.units) ? q/t.units : null;
     perUnit[b.id] = pu;
     if(pu!=null && pu < bestVal){ bestVal = pu; bestId = b.id; }
-    const m = modeAgg[b.mode] || (modeAgg[b.mode]={cases:0,units:0,quote:0,hasQ:false});
-    m.cases+=t.cartons; m.units+=t.units; if(q){ m.quote+=q; m.hasQ=true; }
+    const m = modeAgg[b.mode] || (modeAgg[b.mode]={cases:0,units:0,quote:0,hasQ:false,kg:0,cbm:0,actual:0,hasA:false});
+    m.cases+=t.cartons; m.units+=t.units;
+    const ma = invoiceActual(b);
+    /* Rate on the weight/volume actually billed where the carrier stated one, matching the per-row
+       columns; otherwise the by-mode $/kg disagrees with the table for the same shipment. */
+    m.kg  += (ma!=null && billedKgOf(b)!=null)  ? billedKgOf(b)  : t.kg;
+    m.cbm += (ma!=null && billedCbmOf(b)!=null) ? billedCbmOf(b) : t.cbm;
+    if(q){ m.quote+=q; m.hasQ=true; }
+    if(ma!=null){ m.actual+=ma; m.hasA=true; }
   });
   let Tc=0,Tu=0,Tk=0,Tv=0,Tq=0, anyQ=false, Ta=0, anyA=false;
   const rows = state.buckets.map(b=>{
@@ -1336,6 +1393,14 @@ function renderSummary(){
       <td class="num">${act!=null?fmt$(act):"<span class='hint'>pending</span>"}</td>
       <td class="num">${(()=>{ const v=invoiceVariance(b); return v?`<span class="varchip ${varianceClass(v.pct)}">${varianceText(v)}</span>`:"-"; })()}</td>
       <td class="num ${isBest?"bestcell":""}"${isBest?' title="Cheapest per unit"':''}>${pu!=null?fmt(pu,3)+(isBest?" ✓":""):"-"}</td>
+      ${(()=>{
+        // rate on the billed figure where there is one, otherwise the quote; billed weight wins over planned
+        const basis = act!=null ? act : q;
+        if(basis==null) return '<td class="num">-</td><td class="num">-</td>';
+        const dk = dispKg(act!=null && billedKgOf(b)!=null ? billedKgOf(b) : t.kg);
+        const dv = dispCbm(act!=null && billedCbmOf(b)!=null ? billedCbmOf(b) : t.cbm);
+        return `<td class="num">${dk?fmt(basis/dk,2):"-"}</td><td class="num">${dv?fmt(basis/dv,0):"-"}</td>`;
+      })()}
       <td class="num">${b.transit||"-"}</td>
       <td class="${late.length?"late-cell":""}">${dstr(bucketEta(b))}${late.length?" ⚠":""}${b.arrDate?`<div class="hint">arr ${esc(b.arrDate)}</div>`:""}</td>
     </tr>`;
@@ -1344,11 +1409,19 @@ function renderSummary(){
   const modes = Object.keys(modeAgg);
   const byMode = modes.length>1 ? `<div class="bymode">${modes.map(m=>{
     const a = modeAgg[m];
-    const blended = (a.hasQ && a.units) ? " · "+fmt(a.quote/a.units,3)+" $/unit" : "";
-    return `<span><b>${MODES[m]}</b>: ${a.cases} cases · ${fmt(a.units,0)} units${a.hasQ?" · "+fmt$(a.quote):""}${blended}</span>`;
+    /* Rate per weight and per volume alongside per unit: which one matters depends on the mode —
+       air prices on weight, ocean on volume — so showing only $/unit hides the comparison. */
+    const basis = a.hasA ? a.actual : a.quote;          // bill if we have it, quote otherwise
+    const has = a.hasA || a.hasQ;
+    const dk = dispKg(a.kg), dv = dispCbm(a.cbm);
+    const bits = [];
+    if(has && a.units) bits.push("<b>"+fmt(basis/a.units,3)+"</b> $/unit");
+    if(has && dk)      bits.push(fmt(basis/dk,2)+" $/"+weightUnitLabel());
+    if(has && dv)      bits.push(fmt(basis/dv,0)+" $/"+volUnitLabel());
+    return `<span><b>${MODES[m]}</b>: ${a.cases} cases · ${fmt(a.units,0)} units · ${fmt(dk,0)} ${weightUnitLabel()} · ${fmt(dv,2)} ${volUnitLabel()}${has?" · "+fmt$(basis)+(a.hasA?" billed":""):""}${bits.length?" · "+bits.join(" · "):""}</span>`;
   }).join("")}</div>` : "";
   body.innerHTML = `<div style="overflow:auto"><table>
-    <thead><tr><th>Shipment</th><th>Mode</th><th>Destination</th><th>Status</th><th class="num">Cases</th><th class="num">Units</th><th class="num">${weightUnitLabel().toUpperCase()}</th><th class="num">${volUnitLabel()}</th><th class="num">Quote</th><th class="num">Billed</th><th class="num">Variance</th><th class="num">$/unit</th><th class="num">Transit</th><th>ETA</th></tr></thead>
+    <thead><tr><th>Shipment</th><th>Mode</th><th>Destination</th><th>Status</th><th class="num">Cases</th><th class="num">Units</th><th class="num">${weightUnitLabel().toUpperCase()}</th><th class="num">${volUnitLabel()}</th><th class="num">Quote</th><th class="num">Billed</th><th class="num">Variance</th><th class="num">$/unit</th><th class="num">$/${weightUnitLabel()}</th><th class="num">$/${volUnitLabel()}</th><th class="num">Transit</th><th>ETA</th></tr></thead>
     <tbody>${rows}
     <tr class="total"><td>Total plan</td><td></td><td></td><td></td><td class="num">${Tc}</td><td class="num">${fmt(Tu,0)}</td><td class="num">${fmt(dispKg(Tk),0)}</td><td class="num">${fmt(dispCbm(Tv),2)}</td><td class="num">${anyQ?fmt$(Tq):"-"}</td><td class="num">${anyA?fmt$(Ta):"-"}</td><td class="num">${(()=>{
       const pv=planVariance();
@@ -1357,7 +1430,7 @@ function renderSummary(){
          have both a quote and an invoice. Say so, or the row looks like it cannot do arithmetic. */
       const partial = pv.n < state.buckets.length;
       return `<span class="varchip ${varianceClass(pv.pct)}"${partial?` title="Compares the ${pv.n} shipment${pv.n>1?"s":""} that have both a quote and an invoice — not the full plan total to the left"`:""}>${varianceText(pv)}</span>${partial?`<div class="hint" style="font-weight:400">on ${pv.n} of ${state.buckets.length}</div>`:""}`;
-    })()}</td><td class="num">${anyQ&&Tu?fmt(Tq/Tu,3):"-"}</td><td></td><td></td></tr>
+    })()}</td><td class="num">${anyQ&&Tu?fmt(Tq/Tu,3):"-"}</td><td class="num">${anyQ&&Tk?fmt(Tq/dispKg(Tk),2):"-"}</td><td class="num">${anyQ&&Tv?fmt(Tq/dispCbm(Tv),0):"-"}</td><td></td><td></td></tr>
     </tbody></table></div>
     ${byMode}
     ${(()=>{
@@ -1805,6 +1878,21 @@ document.addEventListener("input", e=>{
   if(t.dataset.invamt){ const b2=bucketOf(t.dataset.invamt); if(b2) invOf(b2).amount=t.value; }
   if(t.dataset.chargeamt){ const [bid,i]=t.dataset.chargeamt.split("|"); const b2=bucketOf(bid); const c=b2&&invOf(b2).charges[+i]; if(c) c.amount=t.value; }
   if(t.dataset.bestcustoms){ const b2=bucketOf(t.dataset.bestcustoms); if(b2) b2.estCustoms=t.value; }
+  if(t.dataset.invkg){
+    const b2=bucketOf(t.dataset.invkg);
+    if(b2){ const inv2=invOf(b2);
+      // only write when the shown number actually changed, so tabbing through cannot nudge storage
+      const shown = billedKgOf(b2)!=null ? String(+(dispKg(billedKgOf(b2))).toFixed(1)) : "";
+      if(String(t.value).trim()!==shown) inv2.billedKg = t.value==="" ? "" : kgFromInput(t.value);
+    }
+  }
+  if(t.dataset.invcbm){
+    const b2=bucketOf(t.dataset.invcbm);
+    if(b2){ const inv2=invOf(b2);
+      const shown = billedCbmOf(b2)!=null ? String(+(dispCbm(billedCbmOf(b2))).toFixed(2)) : "";
+      if(String(t.value).trim()!==shown) inv2.billedCbm = t.value==="" ? "" : cbmFromInput(t.value);
+    }
+  }
   if(t.dataset.bestduty){ const b2=bucketOf(t.dataset.bestduty); if(b2) b2.estDuty=t.value; }
   if(t.dataset.btransit){ const bt=bucketOf(t.dataset.btransit); if(bt) bt.transit=t.value; }
   /* text fields inside the tracking <details>: just update state on every keystroke, no re-render (would collapse the details / steal focus); a full re-render happens on "change" (blur/commit) below */
@@ -1846,6 +1934,7 @@ document.addEventListener("change", e=>{
   if(t.dataset.chargeamt){ const [bid,i]=t.dataset.chargeamt.split("|"); const b2=bucketOf(bid); const c=b2&&invOf(b2).charges[+i]; if(c) c.amount=t.value; setTimeout(refreshTotalsSafely,0); }
   if(t.dataset.chargecode){ const [bid,i]=t.dataset.chargecode.split("|"); const b2=bucketOf(bid); const c=b2&&invOf(b2).charges[+i]; if(c){ c.code=t.value; openInvoices.add(bid); renderBuckets(); renderSummary(); } }
   if(t.dataset.bestcustoms || t.dataset.bestduty){ setTimeout(refreshTotalsSafely,0); }
+  if(t.dataset.invkg || t.dataset.invcbm){ setTimeout(refreshTotalsSafely,0); }
   if(t.dataset.invstatus){ const b2=bucketOf(t.dataset.invstatus); if(b2){ invOf(b2).status=t.value; openInvoices.add(b2.id); renderBuckets(); renderSummary(); } }
   if(t.dataset.invdate){ const b2=bucketOf(t.dataset.invdate); if(b2) invOf(b2).date=t.value; }
   if(t.dataset.invpaid){ const b2=bucketOf(t.dataset.invpaid); if(b2) invOf(b2).paidDate=t.value; }

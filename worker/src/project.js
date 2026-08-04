@@ -163,7 +163,9 @@ export function projectPlan(plan, ctx) {
       eta: dep && transit ? dep + transit * 86400000 : null,
       arrived_at: toEpoch(b.arrDate), received_at: b.status === "received" ? toEpoch(b.arrDate) : null,
       total_cases: cases, total_units: units, total_weight_kg: kg, total_cbm: cbm,
-      chargeable_kg: null,
+      // what the carrier actually billed on, when the invoice states it (already metric on the wire)
+      chargeable_kg: (b.invoice && b.invoice.billedKg !== "" && b.invoice.billedKg != null
+                      && isFinite(Number(b.invoice.billedKg))) ? Number(b.invoice.billedKg) : null,
       source_app: app, source_ref: b.id,
     }, stamp));
 
