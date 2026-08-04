@@ -50,6 +50,10 @@ const all = (sql,...p) => db.prepare(sql).all(...p);
 /* ---- coverage: nothing from the plan is silently dropped ---- */
 ck("all 12 products projected", one("SELECT COUNT(*) n FROM plan_products").n === 12);
 ck("all 12 SKUs created in the catalog", one("SELECT COUNT(*) n FROM skus").n === 12);
+ck("each plan product records the PO it came from",
+  one("SELECT COUNT(*) n FROM plan_products WHERE po_text IS NOT NULL").n === 12);
+ck("plan-level PO is the fallback when a product has none",
+  one("SELECT po_text FROM plan_products LIMIT 1").po_text === plan.po);
 ck("all 130 cartons projected", one("SELECT COUNT(*) n FROM cartons").n === 130);
 ck("all 4 shipments projected", one("SELECT COUNT(*) n FROM shipments").n === 4);
 ck("references carried over", one("SELECT COUNT(*) n FROM shipment_refs").n > 0);

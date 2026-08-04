@@ -217,6 +217,7 @@ CREATE TABLE IF NOT EXISTS plan_products (
   client_id    TEXT NOT NULL,                 -- the id inside plans.data, so re-sync is stable
   code         TEXT NOT NULL,
   name         TEXT,
+  po_text      TEXT,                          -- PO this product came from; a plan can span several
   deadline     INTEGER,                       -- need-by date
   sort_order   INTEGER,
   created_at   INTEGER NOT NULL, updated_at INTEGER NOT NULL, deleted_at INTEGER

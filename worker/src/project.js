@@ -78,7 +78,10 @@ export function projectPlan(plan, ctx) {
     const ppId = key("pp", planId, p.id);
     rows.plan_products.push(Object.assign({
       id: ppId, org_id: orgId, plan_id: planId, sku_id: skuId, client_id: p.id,
-      code, name: p.name || "", deadline: toEpoch(p.deadline), sort_order: i,
+      code, name: p.name || "",
+      // the product's own PO, falling back to the plan's — a plan can cover several orders
+      po_text: String(p.po || plan.po || "").trim() || null,
+      deadline: toEpoch(p.deadline), sort_order: i,
     }, stamp));
 
     let units = 0, kg = 0, cbm = 0;

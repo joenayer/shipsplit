@@ -13,6 +13,7 @@ to check a rendering change is to render it.
 | `inv2.js` | charge list + migration from the old fixed grid, estimated customs/duty, reference types, document panel |
 | `prop.js` | product weight/dimension edits propagating to every shipment |
 | `rates.js` | billed weight/volume, metric storage under the unit toggle, $/weight and $/volume rates |
+| `packing.js` | packing list carries no commercial or internal data, and every carton names its PO |
 
 Worker + database tests live in `worker/test/` and need no browser:
 

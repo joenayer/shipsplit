@@ -94,6 +94,12 @@ const REF_TYPES = {
   "customs":"Customs entry #",
   "other":"Other"
 };
+/* The packing list is a document that leaves the building — it goes to the factory and the
+   forwarder. These reference types are operational and fine to share; the rest (FBA shipment ids,
+   invoice and customs numbers, forwarder quote ids) are internal and are omitted from it. */
+const REF_SHAREABLE = { tracking:1, container:1, booking:1, po:1, pickup:1 };
+function shareableRefs(b){ return (b.refs||[]).filter(r=>r && r.value && REF_SHAREABLE[r.type]); }
+
 /* transient, in-memory only: which bucket ids have their tracking <details> open right now (not persisted, not saved) */
 const openTracking = new Set();
 const openInvoices = new Set();  // keep the invoice panel open across re-renders, same as tracking
@@ -112,7 +118,10 @@ function normalizePlan(s){
   const out = Object.assign(blankPlan(), s);
   if(!Array.isArray(out.products)) out.products = [];
   if(!Array.isArray(out.buckets)) out.buckets = [];
-  out.products.forEach(p=>{ if(!Array.isArray(p.cartons)) p.cartons = []; });
+  out.products.forEach(p=>{
+    if(!Array.isArray(p.cartons)) p.cartons = [];
+    if(p.po==null) p.po = "";       // falls back to the plan-level PO when blank
+  });
   out.buckets.forEach(b=>{
     if(!b.allocations || typeof b.allocations!=="object") b.allocations = {};
     if(!Array.isArray(b.refs)) b.refs = [];
@@ -128,7 +137,11 @@ function normalizePlan(s){
 function bStatus(b){ return (b && b.status) || "planned"; }
 function statusLabel(s){ return (STATUS_META[s]||STATUS_META.planned).label; }
 
-/* products: {id, code, name, deadline, cartons:[{n, qty, dim, kg, note}]} */
+/* products: {id, code, name, po, deadline, cartons:[{n, qty, dim, kg, note}]} */
+/* A plan often covers more than one PO ("091 + 092"), so each product carries the PO it came from
+   and the plan-level PO is only the fallback. Without this a supplier cannot tell which order a
+   carton belongs to, which is the whole point of putting it on the packing list. */
+function poOf(p){ return (p && p.po && String(p.po).trim()) || (state.po||"").trim(); }
 /* buckets: {id, label, mode, destType, shipTo, quote, transit, allocations:{prodId:count},
              status, carrier, refs:[{type,value}], depDate, arrDate, invoice} -- all tracking optional */
 
@@ -767,7 +780,7 @@ function parsePackingRows(rows){
   let hi = rows.findIndex(r => r && String(r[0]||"").toUpperCase().includes("CARTON"));
   if(hi < 0) hi = 0;
   // fixed fallback columns (the original known-good layout: A carton, B code, C name, D qty, F dim, G kg, I note)
-  let codeCol=1, nameCol=2, qtyCol=3, dimCol=5, kgCol=6, noteCol=8;
+  let codeCol=1, nameCol=2, qtyCol=3, dimCol=5, kgCol=6, noteCol=8, poCol=-1;
   const headerRow = rows[hi];
   if(headerRow){
     const found = {};
@@ -777,6 +790,8 @@ function parsePackingRows(rows){
       if(c.includes("NAME")) found.name=ci;
       if(c.includes("Q'TY") || c.includes("QTY")) found.qty=ci;
       if(c.includes("NOTE")) found.note=ci;
+      // "PO #" / "PO NO" on a supplier's sheet — but not "PRODUCT CODE" or a carton column
+      if(/\bP\.?O\.?\b/.test(c) && !c.includes("PRODUCT") && !c.includes("CARTON")) found.po=ci;
     });
     // packing lists often use a two-row header: sub-headers (DIM / KG / LB) live one row below
     const subRow = rows[hi+1];
@@ -794,6 +809,7 @@ function parsePackingRows(rows){
     if(found.dim!=null) dimCol=found.dim;
     if(found.kg!=null) kgCol=found.kg;
     if(found.note!=null) noteCol=found.note;
+    if(found.po!=null) poCol=found.po;
   }
   const prods = [];
   let cur = null, lastQty = null, lastDim = null, lastKg = null;
@@ -809,14 +825,17 @@ function parsePackingRows(rows){
     }
     const code = r[codeCol] ? String(r[codeCol]).trim() : null;
     const name = r[nameCol] ? String(r[nameCol]).trim() : null;
+    const rowPo = (poCol>=0 && r[poCol]!=null && r[poCol]!=="") ? String(r[poCol]).trim() : "";
     if(code){
-      cur = {id:uid(), code, name:name||code, deadline:"", cartons:[]};
+      cur = {id:uid(), code, name:name||code, po:rowPo, deadline:"", cartons:[]};
       prods.push(cur);
     }
     if(!cur){
-      cur = {id:uid(), code:"(no code)", name:"Imported", deadline:"", cartons:[]};
+      cur = {id:uid(), code:"(no code)", name:"Imported", po:rowPo, deadline:"", cartons:[]};
       prods.push(cur);
     }
+    // a sheet that only states the PO on later rows still fills it in
+    if(cur && !cur.po && rowPo) cur.po = rowPo;
     const qty = (r[qtyCol]!=null && r[qtyCol]!=="") ? Number(r[qtyCol]) : lastQty;
     const dim = (r[dimCol]!=null && r[dimCol]!=="") ? String(r[dimCol]) : lastDim;
     const kg  = (r[kgCol]!=null && r[kgCol]!=="") ? Number(r[kgCol]) : lastKg;
@@ -835,32 +854,51 @@ function parsePackingRows(rows){
 function bucketSheetRows(b, slices){
   const t = bucketTotals(b, slices);
   const rows = [];
+  /* This sheet is sent to the factory and the forwarder, so it deliberately carries NO commercial
+     information: no freight quote, no invoice figures, no internal workflow status, and only the
+     reference types marked shareable. Costs live on the internal Summary sheet of "Export all"
+     instead. Keep it that way — anything added here is something a supplier gets to read. */
   rows.push(["PACKING LIST - " + (b.label||MODES[b.mode])]);
   rows.push(["Brand","Paper Love","","PO #", state.po||""]);
   rows.push(["Plan", state.planName||"","","Date", new Date().toISOString().slice(0,10)]);
   rows.push(["Ship from", state.shipFrom||"","","Ship to", (DEST_TYPES[b.destType]||"") + (b.shipTo? " - "+b.shipTo : "")]);
-  rows.push(["Mode", MODES[b.mode]||b.mode,"","Quote", b.quote?Number(b.quote):"", "Transit days", b.transit||""]);
-  rows.push(["Status", statusLabel(bStatus(b)), "", "Carrier", b.carrier||""]);
+  rows.push(["Mode", MODES[b.mode]||b.mode,"","Transit days", b.transit||"", "Carrier", b.carrier||""]);
   rows.push(["Departed", b.depDate||"", "", "Arrived", b.arrDate||""]);
-  (b.refs||[]).forEach(r=>{ rows.push([REF_TYPES[r.type]||r.type||"Reference", r.value||""]); });
+  shareableRefs(b).forEach(r=>{ rows.push([REF_TYPES[r.type]||r.type||"Reference", r.value||""]); });
   rows.push([]);
-  rows.push(["CARTON #","ORIGINAL CTN #","PRODUCT CODE","PRODUCT NAME","QTY","DIM (CM)","GW (KG)","GW (LB)"]);
+  rows.push(["CARTON #","ORIGINAL CTN #","PO #","PRODUCT CODE","PRODUCT NAME","QTY","DIM (CM)","GW (KG)","GW (LB)"]);
   let seq = 1;
   (slices[b.id]||[]).forEach(rr=>{
+    const po = poOf(rr.prod);
     rr.cartons.forEach(c=>{
-      rows.push([seq++, c.n, rr.prod.code, rr.prod.name, c.qty, c.dim, c.kg, +(c.kg*KG2LB).toFixed(2)]);
+      rows.push([seq++, c.n, po, rr.prod.code, rr.prod.name, c.qty, c.dim, c.kg, +(c.kg*KG2LB).toFixed(2)]);
     });
   });
   rows.push([]);
-  rows.push(["TOTAL","","","", t.units,"", +t.kg.toFixed(1), +(t.kg*KG2LB).toFixed(1)]);
+  rows.push(["TOTAL","","","","", t.units,"", +t.kg.toFixed(1), +(t.kg*KG2LB).toFixed(1)]);
   rows.push(["CARTONS", t.cartons, "CBM", +t.cbm.toFixed(3)]);
+  /* Per-PO subtotals: a combined plan is exactly when the factory needs to reconcile what shipped
+     against each order. Only shown when the shipment actually spans more than one PO. */
+  const byPo = {};
+  (slices[b.id]||[]).forEach(rr=>{
+    const po = poOf(rr.prod) || "(no PO)";
+    const agg = byPo[po] || (byPo[po] = {cartons:0, units:0, kg:0});
+    rr.cartons.forEach(c=>{ agg.cartons++; agg.units += (c.qty||0); agg.kg += (c.kg||0); });
+  });
+  const poKeys = Object.keys(byPo);
+  if(poKeys.length > 1){
+    rows.push([]);
+    rows.push(["BY PO","","","","","","",""]);
+    rows.push(["PO #","CARTONS","UNITS","GW (KG)"]);
+    poKeys.forEach(k=>rows.push([k, byPo[k].cartons, byPo[k].units, +byPo[k].kg.toFixed(1)]));
+  }
   return rows;
 }
 function exportBucket(b){
   const slices = cartonSlices();
   const wb = XLSX.utils.book_new();
   const ws = XLSX.utils.aoa_to_sheet(bucketSheetRows(b, slices));
-  ws["!cols"]=[{wch:9},{wch:13},{wch:18},{wch:26},{wch:7},{wch:13},{wch:9},{wch:9}];
+  ws["!cols"]=[{wch:9},{wch:13},{wch:14},{wch:18},{wch:26},{wch:7},{wch:13},{wch:9},{wch:9}];
   XLSX.utils.book_append_sheet(wb, ws, (b.label||"Shipment").slice(0,28).replace(/[\\/?*\[\]]/g,"-"));
   XLSX.writeFile(wb, safeName((state.planName||"plan")+" - "+(b.label||"shipment"))+".xlsx");
 }
@@ -882,7 +920,7 @@ function exportAll(){
   const used = {};
   state.buckets.forEach((b,i)=>{
     const ws = XLSX.utils.aoa_to_sheet(bucketSheetRows(b, slices));
-    ws["!cols"]=[{wch:9},{wch:13},{wch:18},{wch:26},{wch:7},{wch:13},{wch:9},{wch:9}];
+    ws["!cols"]=[{wch:9},{wch:13},{wch:14},{wch:18},{wch:26},{wch:7},{wch:13},{wch:9},{wch:9}];
     let nm = ((i+1)+" "+(b.label||"Shipment")).slice(0,28).replace(/[\\/?*\[\]]/g,"-");
     if(used[nm]) nm = nm.slice(0,25)+"_"+i; used[nm]=1;
     XLSX.utils.book_append_sheet(wb, ws, nm);
@@ -1125,6 +1163,7 @@ function renderProductsInner(){
           <label title="Weight of each case">${weightUnitLabel()}/case <input type="number" min="0" step="0.1" data-pkg="${p.id}" value="${escAttr(kg0)}">${mixedKg?'<span class="hint" title="Cases currently have different weights; editing sets them all the same">mixed</span>':''}</label>
         </div>
         <div class="pmsku"><label title="Amazon Merchant SKU used on the FBA/AWD upload sheets — leave blank to use the code above">Amazon MSKU <input data-pmsku="${p.id}" value="${escAttr(p.msku||"")}" placeholder="${escAttr(p.code)}" spellcheck="false"></label></div>
+        <div class="pmsku"><label title="The purchase order this product came from. Shown on every carton line of the packing list. Leave blank to use the plan's PO.">PO # <input data-ppo="${p.id}" value="${escAttr(p.po||"")}" placeholder="${escAttr(state.po||"plan PO")}" spellcheck="false"></label></div>
         <div class="pdimrow">
           <label>case (${unit})</label>
           <input data-pdim="${p.id}" value="${escAttr(dv[0])}" placeholder="L" title="Length — applies to all ${p.cartons.length} cases" inputmode="decimal">
@@ -1520,7 +1559,7 @@ function buildProduct(code, name, n, qty, kg, kgUnit, dim, dimUnit){
   if(kgUnit==="lb") kg = kg/KG2LB;
   if(dimUnit==="in"){ const d = parseDim(dim); if(d) dim = d.map(x=>+(x*IN2CM).toFixed(2)).join("x"); }
   const cartons=[]; for(let i=1;i<=n;i++) cartons.push({n:i, qty:qty||0, dim:dim||"", kg:kg||0, note:""});
-  return {id:uid(), code, name:name||code, deadline:"", cartons};
+  return {id:uid(), code, name:name||code, po:"", deadline:"", cartons};
 }
 // add manual product (left panel)
 $("#btnAddProd").onclick = ()=>{
@@ -1920,6 +1959,7 @@ document.addEventListener("input", e=>{
   if(t.dataset.pcode){ const p=state.products.find(x=>x.id===t.dataset.pcode); if(p) p.code=t.value; }
   if(t.dataset.pname){ const p=state.products.find(x=>x.id===t.dataset.pname); if(p) p.name=t.value; }
   if(t.dataset.pmsku){ const p=state.products.find(x=>x.id===t.dataset.pmsku); if(p) p.msku=t.value; }
+  if(t.dataset.ppo){ const p=state.products.find(x=>x.id===t.dataset.ppo); if(p) p.po=t.value; }
   updateSaveIndicator();
 });
 document.addEventListener("change", e=>{
@@ -1951,6 +1991,7 @@ document.addEventListener("change", e=>{
   }
   if(t.dataset.refval){ renderBuckets(); } // value already applied on input; re-render to show/hide the "open" link
   if(t.dataset.pcode){ renderBuckets(); renderSummary(); } // code shows in alloc rows + summary; refresh on commit
+  if(t.dataset.ppo){ const p2=state.products.find(x=>x.id===t.dataset.ppo); if(p2) p2.po=t.value.trim(); }
   if(t.dataset.pqty){
     const p = state.products.find(x=>x.id===t.dataset.pqty);
     if(p){ const qty=Math.max(0,Math.floor(+t.value||0)); p.cartons.forEach(c=>c.qty=qty); render(); }
