@@ -172,7 +172,13 @@ const openFiles = new Set();
    plan sync. Until an API base is configured the panel still renders — it just explains that uploads
    need the backend, rather than failing silently on click. */
 const API_KEY = "shipsplit-api-base";
-function apiBase(){ try { return (localStorage.getItem(API_KEY)||"").replace(/\/+$/,""); } catch(e){ return ""; } }
+/* Deployed 2026-08-04. Overridable from Cloud settings so a local wrangler dev can be pointed at
+   without editing code. */
+const API_DEFAULT = "https://shipsplit.joel-036.workers.dev";
+function apiBase(){
+  try { return ((localStorage.getItem(API_KEY)||API_DEFAULT)).replace(/\/+$/,""); }
+  catch(e){ return API_DEFAULT; }
+}
 function setApiBase(url){ try { localStorage.setItem(API_KEY, String(url||"").trim().replace(/\/+$/,"")); } catch(e){} }
 function cloudOn(){ return !!apiBase(); }
 async function apiFetch(path, opts){
@@ -194,8 +200,49 @@ async function loadFiles(){
     renderBuckets();
   } catch(e){ /* offline or not deployed yet */ }
 }
+/* ---- ShipSplit account (the API that stores documents) ----
+   Deliberately separate from the GitHub sync login: that one encrypts a token in the browser, this
+   one is a real server-side account with recoverable credentials. */
+let apiUser = null;   // email when signed in, null when not
+
+async function refreshAccount(){
+  try {
+    const res = await apiFetch("/auth/me");
+    apiUser = res.ok ? (await res.json()).email : null;
+  } catch(e){ apiUser = null; }
+  paintAccount();
+  renderBuckets();
+  if(apiUser) loadFiles();
+  return apiUser;
+}
+function paintAccount(){
+  const st = $("#acctStatus"), form = $("#acctForm"), inn = $("#acctSignedIn");
+  if(!st) return;
+  if(apiUser){
+    st.innerHTML = 'Signed in as <b>'+esc(apiUser)+'</b>. Documents are being stored.';
+    form.style.display = "none"; inn.style.display = "";
+  } else {
+    st.textContent = "Not signed in. Documents can't be stored until you are.";
+    form.style.display = ""; inn.style.display = "none";
+  }
+  const btn = $("#btnAccount");
+  if(btn) btn.textContent = apiUser ? "Account ✓" : "Account";
+}
+function showCodes(codes){
+  if(!codes || !codes.length) return;
+  $("#acctCodesList").textContent = codes.join("\n");
+  $("#acctCodes").style.display = "";
+}
+async function acctPost(path, body){
+  const res = await apiFetch(path, {
+    method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body||{}),
+  });
+  let data=null; try{ data = await res.json(); }catch(e){}
+  return { ok:res.ok, status:res.status, data:data||{} };
+}
+
 async function uploadFiles(bucketId, fileList){
-  if(!cloudOn()){ toast("Set the API address in Cloud settings to store documents."); return; }
+  if(!apiUser){ toast("Sign in to your ShipSplit account to store documents."); openAccount(); return; }
   if(!state.planName){ toast("Save the plan first, then attach documents to it."); return; }
   const kindSel = document.querySelector('select[data-filekind="'+bucketId+'"]');
   const kind = kindSel ? kindSel.value : "other";
@@ -1316,7 +1363,7 @@ function renderBucketsInner(){
             <select data-filekind="${b.id}">${Object.keys(FILE_KINDS).map(k=>`<option value="${k}">${FILE_KINDS[k]}</option>`).join("")}</select></div>
           <div class="filedrop" data-filedrop="${b.id}">Drop a file here, or click to choose — invoice, label, packing list, anything worth keeping</div>
           <input type="file" data-fileinput="${b.id}" style="display:none" multiple>
-          ${cloudOn() ? "" : `<div class="hint" style="margin-top:6px">Documents upload once cloud sync is switched on.</div>`}
+          ${apiUser ? "" : `<div class="hint" style="margin-top:6px"><a href="#" data-openacct="1">Sign in to your ShipSplit account</a> to store documents.</div>`}
         </div>
       </details>`;
       })()}
@@ -1721,6 +1768,80 @@ async function openCloudModal(){
 }
 $("#btnCloud").onclick = openCloudModal;
 $("#btnGhClose").onclick = ()=>{ $("#cloudOverlay").classList.remove("show"); };
+
+/* ---- account modal wiring ---- */
+function openAccount(){
+  $("#acctApi").value = (()=>{ try{ return localStorage.getItem(API_KEY)||""; }catch(e){ return ""; } })();
+  $("#acctCodes").style.display = "none";
+  $("#acctRecoverForm").style.display = "none";
+  $("#acctOverlay").classList.add("show");
+  refreshAccount();
+}
+$("#btnAccount").onclick = openAccount;
+$("#btnAcctClose").onclick = ()=>{ $("#acctOverlay").classList.remove("show"); };
+$("#acctOverlay").addEventListener("click", e=>{ if(e.target && e.target.id==="acctOverlay") $("#btnAcctClose").click(); });
+$("#acctApi").addEventListener("change", e=>{
+  const v = e.target.value.trim();
+  // blank means "use the deployed default" rather than "no API"
+  try { if(v) localStorage.setItem(API_KEY, v.replace(/\/+$/,"")); else localStorage.removeItem(API_KEY); } catch(err){}
+  toast("API address updated"); refreshAccount();
+});
+$("#btnAcctSignin").onclick = async ()=>{
+  const email=$("#acctEmail").value.trim(), password=$("#acctPass").value;
+  if(!email||!password){ toast("Enter your email and password."); return; }
+  const r = await acctPost("/auth/login", {email,password});
+  if(!r.ok){ toast(r.data.error||"Could not sign in."); return; }
+  $("#acctPass").value=""; toast("Signed in"); refreshAccount();
+};
+$("#btnAcctSignup").onclick = async ()=>{
+  const email=$("#acctEmail").value.trim(), password=$("#acctPass").value;
+  if(!email||password.length<8){ toast("Enter an email and a password of at least 8 characters."); return; }
+  const r = await acctPost("/auth/signup", {email,password});
+  if(!r.ok){ toast(r.data.error||"Could not create the account."); return; }
+  $("#acctPass").value="";
+  showCodes(r.data.recoveryCodes);
+  toast("Account created — save your recovery codes");
+  refreshAccount();
+};
+$("#btnAcctSignout").onclick = async ()=>{
+  await acctPost("/auth/logout", {});
+  shipmentFiles = {}; toast("Signed out"); refreshAccount();
+};
+$("#btnAcctCodes").onclick = async ()=>{
+  const password = prompt("Confirm your password to issue new recovery codes:");
+  if(!password) return;
+  const r = await acctPost("/auth/recovery-codes", {password});
+  if(!r.ok){ toast(r.data.error||"Could not issue new codes."); return; }
+  showCodes(r.data.recoveryCodes);
+  toast("New codes issued — the old unused ones no longer work");
+};
+$("#acctForgot").onclick = e=>{
+  e.preventDefault();
+  $("#acctForm").style.display="none"; $("#acctRecoverForm").style.display="";
+  $("#acctRecEmail").value = $("#acctEmail").value.trim();
+};
+$("#btnAcctRecCancel").onclick = ()=>{ $("#acctRecoverForm").style.display="none"; paintAccount(); };
+$("#btnAcctRecover").onclick = async ()=>{
+  const email=$("#acctRecEmail").value.trim(), code=$("#acctRecCode").value.trim(), newPassword=$("#acctRecPass").value;
+  if(!email||!code||newPassword.length<8){ toast("Fill in all three fields; the password needs 8+ characters."); return; }
+  const r = await acctPost("/auth/recover", {email,code,newPassword});
+  if(!r.ok){ toast(r.data.error||"That code was not accepted."); return; }
+  $("#acctRecPass").value=""; $("#acctRecCode").value="";
+  $("#acctRecoverForm").style.display="none";
+  toast("Password reset — "+(r.data.codesRemaining!=null?r.data.codesRemaining+" codes left":"signed in"));
+  refreshAccount();
+};
+$("#btnAcctCopyCodes").onclick = ()=>{
+  const t=$("#acctCodesList").textContent;
+  navigator.clipboard.writeText(t).then(()=>toast("Codes copied"),()=>toast("Select and copy them manually"));
+};
+$("#btnAcctDownloadCodes").onclick = ()=>{
+  const blob=new Blob([$("#acctCodesList").textContent+"\n"],{type:"text/plain"});
+  const url=URL.createObjectURL(blob); const a2=document.createElement("a");
+  a2.href=url; a2.download="shipsplit-recovery-codes.txt";
+  document.body.appendChild(a2); a2.click(); a2.remove();
+  setTimeout(()=>URL.revokeObjectURL(url),10000);
+};
 /* Sync on a device that isn't signed in yet has nothing to pull -> open the sign in / sign up modal instead */
 $("#btnSync").onclick = ()=>{ if(!loadGhConfig().token){ openCloudModal(); return; } pullAndMerge(); };
 
@@ -2103,6 +2224,7 @@ document.addEventListener("click", e=>{
     const b = bucketOf(t.dataset.addref);
     if(b){ if(!b.refs) b.refs=[]; b.refs.push({type:"tracking", value:""}); openTracking.add(b.id); renderBuckets(); }
   }
+  if(t.dataset.openacct){ e.preventDefault(); openAccount(); }
   if(t.dataset.filedrop){
     const inp = document.querySelector('input[data-fileinput="'+t.dataset.filedrop+'"]');
     if(inp) inp.click();
@@ -2341,4 +2463,6 @@ window.addEventListener("load", ()=>{
   markClean(); // baseline for the unsaved-changes indicator: the state we loaded with
   // background cloud sync: never blocks first render, which already happened from localStorage above
   initCloudUI();
+  // and the ShipSplit account, which the Documents panel needs to know about; also non-blocking
+  refreshAccount();
 });

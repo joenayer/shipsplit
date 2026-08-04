@@ -269,6 +269,7 @@
     <button class="btn ghost danger" id="btnDeletePlan">Delete</button>
   </div>
   <div class="hdr-group">
+    <button class="btn ghost" id="btnAccount" title="ShipSplit account — needed to store documents">Account</button>
     <button class="btn ghost" id="btnCloud" title="Cloud sync settings">Cloud: off</button>
     <button class="btn ghost" id="btnSync" title="Pull latest plans from the cloud">Sync</button>
     <span id="syncInfo" class="synctime"></span>
@@ -395,6 +396,60 @@
     </div>
   </div>
 </div>
+<!-- ShipSplit account (the API that stores documents) -->
+<div class="overlay" id="acctOverlay">
+  <div class="modal" style="width:400px">
+    <h3>ShipSplit account</h3>
+    <div class="sub" id="acctStatus" style="margin-bottom:10px">Checking…</div>
+
+    <div id="acctForm">
+      <div class="sub" style="margin-bottom:8px">This is separate from GitHub sync. It stores shipment documents — invoices, labels, packing lists — and gives you a password you can actually recover.</div>
+      <div class="field" style="margin-bottom:8px"><label>Email</label><input id="acctEmail" autocomplete="username" placeholder="you@example.com"></div>
+      <div class="field" style="margin-bottom:8px"><label>Password</label><input type="password" id="acctPass" autocomplete="current-password" placeholder="At least 8 characters"></div>
+      <div style="display:flex;gap:8px;margin-top:10px">
+        <button class="btn primary" id="btnAcctSignin">Sign in</button>
+        <button class="btn" id="btnAcctSignup">Create account</button>
+      </div>
+      <div class="sub" style="margin-top:10px"><a href="#" id="acctForgot">Lost your password? Use a recovery code</a></div>
+    </div>
+
+    <div id="acctRecoverForm" style="display:none">
+      <div class="sub" style="margin-bottom:8px">Enter one of the recovery codes you saved when you created the account. Each code works once and sets a new password.</div>
+      <div class="field" style="margin-bottom:8px"><label>Email</label><input id="acctRecEmail" placeholder="you@example.com"></div>
+      <div class="field" style="margin-bottom:8px"><label>Recovery code</label><input id="acctRecCode" placeholder="K4M9-QR2T-7XZP-BW3N" spellcheck="false"></div>
+      <div class="field" style="margin-bottom:8px"><label>New password</label><input type="password" id="acctRecPass" placeholder="At least 8 characters"></div>
+      <div style="display:flex;gap:8px;margin-top:10px">
+        <button class="btn primary" id="btnAcctRecover">Reset password</button>
+        <button class="btn" id="btnAcctRecCancel">Back</button>
+      </div>
+    </div>
+
+    <div id="acctSignedIn" style="display:none">
+      <div style="display:flex;gap:8px;margin-top:4px">
+        <button class="btn" id="btnAcctCodes" title="Invalidates any unused codes and issues eight new ones">New recovery codes</button>
+        <button class="btn" id="btnAcctSignout">Sign out</button>
+      </div>
+    </div>
+
+    <div id="acctCodes" style="display:none;margin-top:12px">
+      <div class="warnflag" style="margin-bottom:8px"><b>Save these now.</b> They are shown once and are the only way back in if you forget your password.</div>
+      <pre id="acctCodesList" style="background:#f8fafc;border:1px solid var(--line);border-radius:8px;padding:10px;font-size:13px;line-height:1.7;margin:0;user-select:all"></pre>
+      <div style="display:flex;gap:8px;margin-top:8px">
+        <button class="btn" id="btnAcctCopyCodes">Copy</button>
+        <button class="btn" id="btnAcctDownloadCodes">Download</button>
+      </div>
+    </div>
+
+    <details style="margin-top:12px">
+      <summary class="sub" style="cursor:pointer">Advanced: API address</summary>
+      <div class="field" style="margin-top:8px"><input id="acctApi" spellcheck="false" placeholder="https://shipsplit.joel-036.workers.dev"></div>
+      <div class="sub" style="margin-top:4px">Only change this to point at a local dev server.</div>
+    </details>
+
+    <div style="text-align:right;margin-top:14px"><button class="btn" id="btnAcctClose">Close</button></div>
+  </div>
+</div>
+
 <!-- cloud sync settings modal -->
 <div class="overlay" id="cloudOverlay">
   <div class="modal" style="width:380px">

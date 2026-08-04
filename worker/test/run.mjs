@@ -50,6 +50,25 @@ async function call(method, path, body, opts = {}) {
 const results = [];
 const ck = (name, cond) => results.push((cond ? "PASS" : "FAIL") + "  " + name);
 
+/* ---------- platform limits ----------
+   Workers refuses PBKDF2 over 100k iterations; exceeding it 500s every signup and login, and only in
+   production — node:sqlite and Node's WebCrypto happily run any value, so this suite alone would not
+   have caught it. Assert the constant directly. */
+{
+  const src = readFileSync(new URL("../src/index.js", import.meta.url), "utf8");
+  const m = src.match(/const PBKDF2_MAX_ITERATIONS = (\d+)/);
+  const used = await (async () => {
+    const r = await call("POST", "/auth/signup", { email: "kdf@test.com", password: "a good password" }, { ip: "203.0.113.240" });
+    return r.status === 200;
+  })();
+  ck("PBKDF2 cap constant present and set to the Workers limit", m && Number(m[1]) === 100000);
+  ck("configured iterations are within the Workers cap",
+    (src.match(/const PBKDF2_ITERATIONS = (?:PBKDF2_MAX_ITERATIONS|(\d+))/) || [])[1] === undefined ||
+    Number(RegExp.$1) <= 100000);
+  ck("signup succeeds at the configured iteration count", used);
+  cookie = "";
+}
+
 /* ---------- health + CORS ---------- */
 let r = await call("GET", "/health");
 ck("health returns ok", r.status === 200 && r.body.ok === true);

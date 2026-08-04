@@ -12,7 +12,13 @@ const ALLOWED_ORIGINS = [
   "http://localhost:8788",
   "http://127.0.0.1:8788",
 ];
-const PBKDF2_ITERATIONS = 310000;
+/* Cloudflare Workers rejects PBKDF2 above 100,000 iterations outright — the deriveBits call throws
+   rather than merely running slowly, so 310,000 made every signup and sign-in return a 500. This is
+   an API ceiling, not a CPU budget, so it cannot be bought around with a bigger plan.
+   `users.iterations` is stored per row, so if Workers ever raises the cap this constant can go up and
+   accounts re-hash as each password is next set — no migration. */
+const PBKDF2_MAX_ITERATIONS = 100000;   // hard platform limit
+const PBKDF2_ITERATIONS = PBKDF2_MAX_ITERATIONS;
 const SESSION_DAYS = 30;
 const MAX_FAILED = 10;              // failed sign-ins from one IP ...
 const FAIL_WINDOW_MS = 15 * 60000;  // ... within this window before we start refusing
@@ -68,9 +74,11 @@ function safeEqual(a, b) {
   return diff === 0;
 }
 async function pbkdf2(password, saltB64, iterations) {
+  // never hand Workers a value it will refuse; a rejected derive would surface as a 500 on login
+  const iters = Math.min(Number(iterations) || PBKDF2_ITERATIONS, PBKDF2_MAX_ITERATIONS);
   const salt = Uint8Array.from(atob(saltB64), c => c.charCodeAt(0));
   const key = await crypto.subtle.importKey("raw", enc.encode(password), { name: "PBKDF2" }, false, ["deriveBits"]);
-  const bits = await crypto.subtle.deriveBits({ name: "PBKDF2", salt, iterations, hash: "SHA-256" }, key, 256);
+  const bits = await crypto.subtle.deriveBits({ name: "PBKDF2", salt, iterations: iters, hash: "SHA-256" }, key, 256);
   return b64(bits);
 }
 function randomB64(bytes) {
