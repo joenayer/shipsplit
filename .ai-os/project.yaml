@@ -1,0 +1,27 @@
+version: 1
+project:
+  name: shipsplit
+  domain: paperlove
+  repository: joenayer/shipsplit
+  portfolio_role: governed-independent-child
+  coordination_mode: single-agent
+  source_of_truth:
+    - AGENTS.md
+    - BACKEND-PLAN.md
+    - worker/README.md
+    - app.js
+  decisions: BACKEND-PLAN.md
+  current_work: BACKEND-PLAN.md
+  email_label: project/paperlove
+  enabled_skills: []
+  enabled_integrations: []
+  sending_authority: not-applicable
+  deployment_authority: approval-required
+ai_os:
+  repository: joenayer/joel-ai-os
+  version: e951ace60061133a6e3f0c779b8bd23545658313
+  registry_url: https://github.com/joenayer/joel-ai-os/blob/e951ace60061133a6e3f0c779b8bd23545658313/portfolio/repositories.json
+  status: linked
+  generated_overlay: false
+  included_paths: []
+  reviewed_on: 2026-08-09
