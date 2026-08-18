@@ -38,6 +38,10 @@ const API='https://shipsplit.joel-036.workers.dev';
     await p.evaluate(()=>apiSyncPlans.toString().includes('401')));
   ck("not signed in = local only, no crash",
     await p.evaluate(async ()=>{ apiUser=null; return (await apiSyncPlans({quiet:true}))===null; }));
+  ck("apiFetch does not treat an empty same-origin base as missing",
+    await p.evaluate(()=>!/if\s*\(\s*!base\s*\)/.test(apiFetch.toString().replace(/\/\/[^\n]*/g,""))));
+  ck("cloudOn treats the Worker origin (empty base) as configured",
+    await p.evaluate(()=>cloudOn.toString().includes('=== ""')));
 
   console.log(res.join("\n"));
   const f=res.filter(x=>x.startsWith('FAIL')).length;

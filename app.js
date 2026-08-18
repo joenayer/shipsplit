@@ -187,10 +187,18 @@ function apiBase(){
   } catch(e){ return API_DEFAULT; }
 }
 function setApiBase(url){ try { localStorage.setItem(API_KEY, String(url||"").trim().replace(/\/+$/,"")); } catch(e){} }
-function cloudOn(){ return !!apiBase(); }
+function cloudOn(){
+  // "" means this page IS the API (Worker origin, relative URLs). That is configured, not missing.
+  // `!!apiBase()` used to be false there, so Sign In and documents both thought there was no server.
+  const base = apiBase();
+  return base === "" || !!base;
+}
 async function apiFetch(path, opts){
   const base = apiBase();
-  if(!base) throw new Error("no-api");
+  // empty string is intentional — same-origin relative URLs. The old `if(!base)` treated that as
+  // "no API configured", threw, and the Sign In click had no try/catch, so the button looked dead
+  // on the Cloudflare-hosted app. null/undefined is the only real "missing" case.
+  if(base == null) throw new Error("no-api");
   return fetch(base+path, Object.assign({credentials:"include"}, opts||{}));
 }
 /* Refresh the document list for the current plan. Failures are non-fatal: documents are an extra,
@@ -1872,17 +1880,27 @@ $("#acctApi").addEventListener("change", e=>{
 $("#btnAcctSignin").onclick = async ()=>{
   const email=$("#acctEmail").value.trim(), password=$("#acctPass").value;
   if(!email||!password){ toast("Enter your email and password."); return; }
-  const r = await acctPost("/auth/login", {email,password});
-  if(!r.ok){ toast(r.data.error||"Could not sign in."); return; }
-  $("#acctPass").value="";
-  /* The password was right — but the session lives in a cookie, and when the page and the API are on
-     different domains that cookie is third-party. Safari blocks those outright and Chrome is phasing
-     them out, so the browser accepts the response and silently drops the cookie. The sign-in then
-     looks like it did nothing at all. Detect it by asking who we are straight away, and say what is
-     actually wrong instead of failing mutely. */
-  const who = await refreshAccount();
-  if(!who){ showCookieBlocked(); return; }
-  toast("Signed in");
+  const btn = $("#btnAcctSignin"), st = $("#acctStatus");
+  if(st) st.textContent = "Signing in…";
+  if(btn) btn.disabled = true;
+  try{
+    const r = await acctPost("/auth/login", {email,password});
+    if(!r.ok){ toast((r.data && r.data.error)||"Could not sign in."); paintAccount(); return; }
+    $("#acctPass").value="";
+    /* The password was right — but the session lives in a cookie, and when the page and the API are on
+       different domains that cookie is third-party. Safari blocks those outright and Chrome is phasing
+       them out, so the browser accepts the response and silently drops the cookie. The sign-in then
+       looks like it did nothing at all. Detect it by asking who we are straight away, and say what is
+       actually wrong instead of failing mutely. */
+    const who = await refreshAccount();
+    if(!who){ showCookieBlocked(); return; }
+    toast("Signed in");
+  }catch(err){
+    toast("Could not reach the sign-in server.");
+    paintAccount();
+  }finally{
+    if(btn) btn.disabled = false;
+  }
 };
 function showCookieBlocked(){
   const el = $("#acctStatus");
@@ -1897,12 +1915,16 @@ function showCookieBlocked(){
 $("#btnAcctSignup").onclick = async ()=>{
   const email=$("#acctEmail").value.trim(), password=$("#acctPass").value;
   if(!email||password.length<8){ toast("Enter an email and a password of at least 8 characters."); return; }
-  const r = await acctPost("/auth/signup", {email,password});
-  if(!r.ok){ toast(r.data.error||"Could not create the account."); return; }
-  $("#acctPass").value="";
-  showCodes(r.data.recoveryCodes);
-  toast("Account created — save your recovery codes");
-  refreshAccount();
+  try{
+    const r = await acctPost("/auth/signup", {email,password});
+    if(!r.ok){ toast((r.data && r.data.error)||"Could not create the account."); return; }
+    $("#acctPass").value="";
+    showCodes(r.data.recoveryCodes);
+    toast("Account created — save your recovery codes");
+    refreshAccount();
+  }catch(err){
+    toast("Could not reach the server.");
+  }
 };
 $("#btnAcctSignout").onclick = async ()=>{
   await acctPost("/auth/logout", {});
@@ -1925,12 +1947,16 @@ $("#btnAcctRecCancel").onclick = ()=>{ $("#acctRecoverForm").style.display="none
 $("#btnAcctRecover").onclick = async ()=>{
   const email=$("#acctRecEmail").value.trim(), code=$("#acctRecCode").value.trim(), newPassword=$("#acctRecPass").value;
   if(!email||!code||newPassword.length<8){ toast("Fill in all three fields; the password needs 8+ characters."); return; }
-  const r = await acctPost("/auth/recover", {email,code,newPassword});
-  if(!r.ok){ toast(r.data.error||"That code was not accepted."); return; }
-  $("#acctRecPass").value=""; $("#acctRecCode").value="";
-  $("#acctRecoverForm").style.display="none";
-  toast("Password reset — "+(r.data.codesRemaining!=null?r.data.codesRemaining+" codes left":"signed in"));
-  refreshAccount();
+  try{
+    const r = await acctPost("/auth/recover", {email,code,newPassword});
+    if(!r.ok){ toast((r.data && r.data.error)||"That code was not accepted."); return; }
+    $("#acctRecPass").value=""; $("#acctRecCode").value="";
+    $("#acctRecoverForm").style.display="none";
+    toast("Password reset — "+(r.data.codesRemaining!=null?r.data.codesRemaining+" codes left":"signed in"));
+    refreshAccount();
+  }catch(err){
+    toast("Could not reach the server.");
+  }
 };
 $("#btnAcctCopyCodes").onclick = ()=>{
   const t=$("#acctCodesList").textContent;
