@@ -24,13 +24,16 @@ const fetches = [];
 const sandbox = {
   API_KEY: "shipsplit-api-base",
   API_DEFAULT: API,
-  location: { origin: API },
+  location: { origin: API, hostname: "shipsplit.joel-036.workers.dev" },
   localStorage: { getItem() { return null; }, setItem() {}, removeItem() {} },
   fetch: async (url, opts) => { fetches.push({ url, opts }); return { ok: true, url, status: 200 }; },
 };
 vm.createContext(sandbox);
 vm.runInContext([sliceFn("apiBase"), sliceFn("cloudOn"), sliceFn("apiFetch")].join("\n"), sandbox);
 
+vm.runInContext([sliceFn("hostKind"), sliceFn("isCloudflareHost"), sliceFn("isGitHubHost")].join("\n"), sandbox);
+ck("Worker origin is classified as the Cloudflare host",
+  vm.runInContext("isCloudflareHost()", sandbox) === true);
 ck("on the Worker origin, apiBase is a relative (empty) URL",
   vm.runInContext("apiBase()", sandbox) === "");
 ck("on the Worker origin, the API is still considered configured",
@@ -48,7 +51,10 @@ ck("on the Worker origin, the API is still considered configured",
     threw == null && fetches[0] && fetches[0].opts && fetches[0].opts.credentials === "include");
 
   sandbox.location.origin = "https://joenayer.github.io";
-  ck("GitHub Pages still points at the deployed Worker",
+  sandbox.location.hostname = "joenayer.github.io";
+  ck("github.io is classified as the GitHub host",
+    vm.runInContext("isGitHubHost()", sandbox) === true);
+  ck("GitHub Pages still has a Worker URL if something asks (not used for login)",
     vm.runInContext("apiBase()", sandbox) === API);
   ck("GitHub Pages still considers the API configured",
     vm.runInContext("cloudOn()", sandbox) === true);

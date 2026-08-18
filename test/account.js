@@ -10,18 +10,24 @@ const API='https://shipsplit.joel-036.workers.dev';
     proxy: process.env.HTTPS_PROXY ? { server: process.env.HTTPS_PROXY } : undefined,
     args: ['--ignore-certificate-errors'],
   });
-  // the app is served from github.io in production; match that origin so CORS behaves as it will live
+  // account login lives on the Worker origin; serve this checkout there, let API routes hit the live Worker
   const ctx=await b.newContext({ ignoreHTTPSErrors: true });
   const p=await ctx.newPage();
-  await p.route('https://joenayer.github.io/shipsplit/**', async route=>{
+  await p.route(API+'/**', async route=>{
     const u=new URL(route.request().url());
-    const f=u.pathname.replace('/shipsplit/','')||'index.html';
+    const apiPath=u.pathname.replace(/\/+$/,'')||'/';
+    if(apiPath==='/health'||apiPath.startsWith('/auth')||apiPath.startsWith('/plans')||apiPath.startsWith('/files')){
+      return route.continue();
+    }
+    const f=(u.pathname==='/'||u.pathname==='')?'index.html':u.pathname.replace(/^\//,'');
     try{ await route.fulfill({path:path.resolve(__dirname,'..',f)}); }
-    catch(e){ await route.fulfill({status:404,body:'no'}); }
+    catch(e){ await route.continue(); }
   });
-  await p.goto('https://joenayer.github.io/shipsplit/index.html');
+  await p.goto(API+'/');
   await p.waitForFunction(()=>typeof window.normalizePlan==='function');
-  await p.waitForTimeout(1200);
+  await p.waitForTimeout(400);
+  // lander requires a choice; guest unblocks the page without creating an account
+  await p.evaluate(()=>{ if(typeof setGuest==='function'){ setGuest(true); hideGate(); } });
 
   /* This suite needs real network access to the deployed Worker. Sandboxed CI cannot egress, so skip
      rather than fail — a red result there would be about the sandbox, not the code. */
@@ -32,7 +38,12 @@ const API='https://shipsplit.joel-036.workers.dev';
     console.log("SKIP  live API unreachable from this environment (no outbound network)");
     await b.close(); process.exit(0);
   }
-  ck("client points at the deployed API by default", await p.evaluate(()=>apiBase())===API);
+  ck("this origin is the Cloudflare host", await p.evaluate(()=>isCloudflareHost()===true));
+  ck("GitHub login is hidden on the Worker origin", await p.evaluate(()=>{
+    const b=document.querySelector('#btnCloud');
+    return !b || b.style.display==="none";
+  }));
+  ck("client talks to this Worker (relative or absolute)", await p.evaluate(()=>apiBase()===""||apiBase()===API));
   ck("starts signed out", await p.evaluate(()=>apiUser)===null);
 
   const email='test-'+Date.now()+'@example.com';

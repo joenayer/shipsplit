@@ -175,6 +175,46 @@ const API_KEY = "shipsplit-api-base";
 /* Deployed 2026-08-04. Overridable from Cloud settings so a local wrangler dev can be pointed at
    without editing code. */
 const API_DEFAULT = "https://shipsplit.joel-036.workers.dev";
+/* One host, one login, one store. The Worker origin is the account + D1 app. GitHub Pages is the
+   token/password GitHub sync app. Mixing both on one page was two databases and two Sign In buttons
+   for the same work. Local file:// / localhost keeps both so tests can reach either path. */
+function hostKind(){
+  try {
+    if(location.origin === API_DEFAULT) return "cf";
+    if(/github\.io$/.test(location.hostname)) return "gh";
+  } catch(e){}
+  return "local";
+}
+function isCloudflareHost(){ return hostKind()==="cf"; }
+function isGitHubHost(){ return hostKind()==="gh"; }
+const GUEST_KEY = "shipsplit-guest";
+let guestMode = false;
+function loadGuest(){ try{ return localStorage.getItem(GUEST_KEY)==="1"; }catch(e){ return false; } }
+function setGuest(on){
+  guestMode = !!on;
+  try{ if(on) localStorage.setItem(GUEST_KEY,"1"); else localStorage.removeItem(GUEST_KEY); }catch(e){}
+}
+function showGate(){ const el=$("#gateOverlay"); if(el) el.classList.add("show"); }
+function hideGate(){ const el=$("#gateOverlay"); if(el) el.classList.remove("show"); }
+function applyHostChrome(){
+  const hide = (id, on)=>{ const el=$("#"+id); if(el) el.style.display = on ? "none" : ""; };
+  if(isCloudflareHost()){
+    hide("btnCloud", true);
+    hide("btnDb", true);
+    hide("btnAccount", false);
+    const acct = $("#btnAccount");
+    if(acct) acct.title = "Sign in or manage your account";
+    if(loadGuest()) guestMode = true;
+    else showGate();
+  } else if(isGitHubHost()){
+    hide("btnAccount", true);
+    hide("btnDb", true);
+    hide("btnCloud", false);
+    const cloud = $("#btnCloud");
+    if(cloud) cloud.title = "Sign in with GitHub to sync your plans";
+    hideGate();
+  }
+}
 /* When the page is served BY the Worker, talk to it with relative URLs: same origin means no CORS
    preflight and no cross-site cookie at all. Falls back to the absolute URL while the app is still
    served from GitHub Pages. */
@@ -221,28 +261,34 @@ async function loadFiles(){
 let apiUser = null;   // email when signed in, null when not
 
 async function refreshAccount(){
+  if(isGitHubHost()){ apiUser = null; paintAccount(); return null; }
   try {
     const res = await apiFetch("/auth/me");
     apiUser = res.ok ? (await res.json()).email : null;
   } catch(e){ apiUser = null; }
   paintAccount();
   renderBuckets();
-  if(apiUser){ loadFiles(); apiSyncPlans({quiet:true}); setDbState("on"); }
-  else setDbState("signedout");
+  if(apiUser){
+    setGuest(false);
+    hideGate();
+    loadFiles(); apiSyncPlans({quiet:true}); setDbState("on");
+  } else setDbState("signedout");
   return apiUser;
 }
 function paintAccount(){
   const st = $("#acctStatus"), form = $("#acctForm"), inn = $("#acctSignedIn");
   if(!st) return;
   if(apiUser){
-    st.innerHTML = 'Signed in as <b>'+esc(apiUser)+'</b>. Documents are being stored.';
+    st.innerHTML = 'Signed in as <b>'+esc(apiUser)+'</b>. Plans and documents save to your account.';
     form.style.display = "none"; inn.style.display = "";
   } else {
-    st.textContent = "Not signed in. Documents can't be stored until you are.";
+    st.textContent = guestMode
+      ? "Guest mode. Plans stay on this device until you sign in."
+      : "Not signed in. Plans and documents save to your account once you are.";
     form.style.display = ""; inn.style.display = "none";
   }
   const btn = $("#btnAccount");
-  if(btn) btn.textContent = apiUser ? "Account ✓" : "Account";
+  if(btn) btn.textContent = apiUser ? "Account ✓" : guestMode ? "Guest" : "Sign in";
 }
 function showCodes(codes){
   if(!codes || !codes.length) return;
@@ -258,7 +304,10 @@ async function acctPost(path, body){
 }
 
 async function uploadFiles(bucketId, fileList){
-  if(!apiUser){ toast("Sign in to your ShipSplit account to store documents."); openAccount(); return; }
+  if(!apiUser){
+    if(isGitHubHost()){ toast("Documents live on the Cloudflare-hosted app — sign in there."); return; }
+    toast("Sign in to your ShipSplit account to store documents."); openAccount(); return;
+  }
   if(!state.planName){ toast("Save the plan first, then attach documents to it."); return; }
   const kindSel = document.querySelector('select[data-filekind="'+bucketId+'"]');
   const kind = kindSel ? kindSel.value : "other";
@@ -539,7 +588,14 @@ function syncAgoText(){
   return "synced "+Math.floor(h/24)+"d ago";
 }
 function markSynced(){ lastSyncAt = Date.now(); updateSyncInfo(); }
-function updateSyncInfo(){ const el = $("#syncInfo"); if(el) el.textContent = (cloudState==="on") ? syncAgoText() : ""; }
+function updateSyncInfo(){
+  const el = $("#syncInfo"); if(!el) return;
+  if(isCloudflareHost()){
+    el.textContent = apiUser ? syncAgoText() : (guestMode ? "guest · this device only" : "");
+    return;
+  }
+  el.textContent = (cloudState==="on") ? syncAgoText() : "";
+}
 /* unicode-safe base64 encode; chunked to avoid stack overflow on String.fromCharCode(...bigArray) */
 function b64EncodeUnicode(str){
   const bytes = new TextEncoder().encode(str);
@@ -637,16 +693,12 @@ async function pullAndMerge(opts){
     return null;
   }
 }
-/* ================= ShipSplit database sync (primary) =================
-   Plans live in the ShipSplit database now. GitHub stays wired up underneath as a backup while the
-   switch beds in — a plan you save is written to the browser, then to the database, then to GitHub,
-   so no single one of them holds the only copy.
-
-   The server does the same newer-wins merge the local mergeStores() does, and hands the merged set
-   back, so one /plans/sync call covers both directions. */
+/* ================= ShipSplit database sync (Cloudflare host) =================
+   On the Worker origin, the D1 account is the only cloud store. GitHub Pages uses GitHub sync
+   instead — same app, one login and one database per host, not both at once. */
 async function apiSyncPlans(opts){
   opts = opts || {};
-  if(!apiUser) return null;                 // not signed in: local + GitHub only
+  if(!apiUser) return null;                 // guest / signed out: this device only
   const localRaw = loadRawStore();
   const plans = {}, deleted = Object.assign({}, localRaw.__deleted__ || {});
   for(const k in localRaw){ if(k!=="__deleted__" && localRaw[k]) plans[k] = localRaw[k]; }
@@ -677,10 +729,14 @@ async function apiSyncPlans(opts){
     return null;
   }
 }
-/* Save/delete path: database first (it is the record), then GitHub as a redundant copy. */
+/* Save/delete path: one cloud, matching the host. Never write both stores from one page. */
 async function syncEverywhere(opts){
+  if(isGitHubHost()){
+    if(loadGhConfig().token){ try { await pushToCloud(opts); } catch(e){} }
+    return null;
+  }
+  if(isCloudflareHost()) return await apiSyncPlans(opts);
   const merged = await apiSyncPlans(opts);
-  // GitHub only runs if it is still configured; failures there are no longer user-facing noise
   if(loadGhConfig().token){ try { await pushToCloud({quiet:true}); } catch(e){} }
   return merged;
 }
@@ -718,15 +774,15 @@ async function pushToCloud(opts){
   }
 }
 function initCloudUI(){
+  if(isCloudflareHost()) return;            // Worker origin has no GitHub login
   const cfg = loadGhConfig();
   if(cfg.token){
     setCloudState("on");
     pullAndMerge({quiet:false});
   } else {
     setCloudState("off");
-    /* no local token: if a sync setup already exists, nudge the user to sign in (never blocking) */
     fetchSyncConfigBlob().then(blob=>{
-      if(blobHasSetup(blob) && !loadGhConfig().token){ toast("Click Cloud to sign in and sync your plans"); }
+      if(blobHasSetup(blob) && !loadGhConfig().token){ toast("Click GitHub to sign in and sync your plans"); }
     }).catch(()=>{});
   }
 }
@@ -1449,7 +1505,9 @@ function renderBucketsInner(){
             <select id="fk-${b.id}" data-filekind="${b.id}">${Object.keys(FILE_KINDS).map(k=>`<option value="${k}">${FILE_KINDS[k]}</option>`).join("")}</select></div>
           <div class="filedrop" data-filedrop="${b.id}">Drop a file here, or click to choose — invoice, label, packing list, anything worth keeping</div>
           <input type="file" data-fileinput="${b.id}" style="display:none" multiple>
-          ${apiUser ? "" : `<div class="hint" style="margin-top:8px"><a href="#" data-openacct="1">Sign in to your ShipSplit account</a> to store documents.</div>`}
+          ${isGitHubHost()
+            ? `<div class="hint" style="margin-top:8px">Documents are stored on the Cloudflare-hosted app after you sign in there.</div>`
+            : apiUser ? "" : `<div class="hint" style="margin-top:8px"><a href="#" data-openacct="1">Sign in to your ShipSplit account</a> to store documents.</div>`}
         </div></div>
       </details>`;
       })()}
@@ -1861,16 +1919,37 @@ $("#btnGhClose").onclick = ()=>{ $("#cloudOverlay").classList.remove("show"); };
 
 /* ---- account modal wiring ---- */
 function openAccount(){
+  if(isGitHubHost()){ openCloudModal(); return; }
+  hideGate();
   $("#acctApi").value = (()=>{ try{ return localStorage.getItem(API_KEY)||""; }catch(e){ return ""; } })();
   $("#acctCodes").style.display = "none";
   $("#acctRecoverForm").style.display = "none";
   $("#acctOverlay").classList.add("show");
   refreshAccount();
 }
+function closeAccount(){
+  $("#acctOverlay").classList.remove("show");
+  if(isCloudflareHost() && !apiUser && !loadGuest()) showGate();
+}
 $("#btnAccount").onclick = openAccount;
 $("#btnDb").onclick = ()=>{ if(apiUser) syncEverywhere({}); else openAccount(); };
-$("#btnAcctClose").onclick = ()=>{ $("#acctOverlay").classList.remove("show"); };
+$("#btnAcctClose").onclick = closeAccount;
 $("#acctOverlay").addEventListener("click", e=>{ if(e.target && e.target.id==="acctOverlay") $("#btnAcctClose").click(); });
+const gateSignin = $("#btnGateSignin");
+if(gateSignin) gateSignin.onclick = ()=>{ hideGate(); openAccount(); };
+const gateGuest = $("#btnGateGuest");
+if(gateGuest) gateGuest.onclick = ()=>{
+  setGuest(true);
+  hideGate();
+  paintAccount();
+  updateSyncInfo();
+  toast("Guest mode — this device only");
+};
+const gateEl = $("#gateOverlay");
+if(gateEl){
+  gateEl.addEventListener("click", e=>{ if(e.target && e.target.id==="gateOverlay") e.stopPropagation(); });
+  gateEl.addEventListener("keydown", e=>{ if(e.key==="Escape") e.preventDefault(); });
+}
 $("#acctApi").addEventListener("change", e=>{
   const v = e.target.value.trim();
   // blank means "use the deployed default" rather than "no API"
@@ -1928,7 +2007,11 @@ $("#btnAcctSignup").onclick = async ()=>{
 };
 $("#btnAcctSignout").onclick = async ()=>{
   await acctPost("/auth/logout", {});
-  shipmentFiles = {}; toast("Signed out"); refreshAccount();
+  shipmentFiles = {};
+  setGuest(false);
+  toast("Signed out");
+  await refreshAccount();
+  if(isCloudflareHost()) showGate();
 };
 $("#btnAcctCodes").onclick = async ()=>{
   const password = prompt("Confirm your password to issue new recovery codes:");
@@ -1969,11 +2052,22 @@ $("#btnAcctDownloadCodes").onclick = ()=>{
   document.body.appendChild(a2); a2.click(); a2.remove();
   setTimeout(()=>URL.revokeObjectURL(url),10000);
 };
-/* Sync on a device that isn't signed in yet has nothing to pull -> open the sign in / sign up modal instead */
+/* Sync talks to this host's store only. No token / no account -> the matching sign-in, not the other one. */
 $("#btnSync").onclick = async ()=>{
+  if(isCloudflareHost()){
+    if(apiUser){ await apiSyncPlans({}); return; }
+    if(guestMode){ toast("Guest mode is this device only. Sign in to sync."); openAccount(); return; }
+    showGate();
+    return;
+  }
+  if(isGitHubHost()){
+    if(loadGhConfig().token){ await pullAndMerge(); return; }
+    openCloudModal();
+    return;
+  }
   if(apiUser){ await syncEverywhere({}); return; }
   if(loadGhConfig().token){ pullAndMerge(); return; }
-  openAccount();   // nothing configured: the database is the thing to set up now, not GitHub
+  openAccount();
 };
 
 // Sign in / Sign up tabs -- carry the typed identifier across so switching never loses it
@@ -2592,26 +2686,16 @@ window.addEventListener("load", ()=>{
   syncAddFormUnits();
   render();
   markClean(); // baseline for the unsaved-changes indicator: the state we loaded with
-  // background cloud sync: never blocks first render, which already happened from localStorage above
-  initCloudUI();
-  // and the ShipSplit account, which the Documents panel needs to know about; also non-blocking
-  refreshAccount();
-  maybeOfferNewAddress();
+  applyHostChrome();
+  // one login per host: GitHub Pages talks to GitHub, the Worker talks to the account
+  if(!isCloudflareHost()) initCloudUI();
+  if(!isGitHubHost()){
+    refreshAccount().then(()=>{
+      if(isCloudflareHost()){
+        if(apiUser){ hideGate(); }
+        else if(loadGuest()){ guestMode = true; hideGate(); paintAccount(); updateSyncInfo(); }
+      }
+    });
+  }
 });
-/* The app now lives on the API's own domain. On the old GitHub Pages copy the login cookie is
-   third-party and many browsers refuse it, so point people at the address where it works instead of
-   letting them hit a wall. Dismissible, and only shown on the old origin. */
-function maybeOfferNewAddress(){
-  if(location.origin === API_DEFAULT) return;
-  if(!/github\.io$/.test(location.hostname)) return;
-  try{ if(localStorage.getItem("shipsplit-moved-dismissed")) return; }catch(e){}
-  const bar = document.createElement("div");
-  bar.className = "movedbar";
-  bar.innerHTML = 'ShipSplit has moved to <a href="' + API_DEFAULT + '/">'
-    + API_DEFAULT.replace(/^https:\/\//,"") + '</a>. '
-    + 'Signing in to your database only works there — this address keeps working for everything else. '
-    + '<button class="btn small" id="movedDismiss">Dismiss</button>';
-  document.body.insertBefore(bar, document.body.firstChild);
-  const d = document.getElementById("movedDismiss");
-  if(d) d.onclick = ()=>{ try{ localStorage.setItem("shipsplit-moved-dismissed","1"); }catch(e){} bar.remove(); };
-}
+applyHostChrome();

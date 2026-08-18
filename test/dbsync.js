@@ -20,18 +20,28 @@ const API='https://shipsplit.joel-036.workers.dev';
   await p.goto('https://joenayer.github.io/shipsplit/index.html');
   await p.waitForFunction(()=>typeof window.normalizePlan==='function');
 
-  // structural checks that need no network
-  ck("Database button exists in the header", await p.$('#btnDb')!==null);
-  ck("GitHub button relabelled as the backup", (await p.textContent('#btnCloud')).startsWith('GitHub'));
-  ck("saving a plan calls the database sync", await p.evaluate(()=>savePlan.toString().includes('syncEverywhere')));
-  ck("database is written before GitHub", await p.evaluate(()=>{
-    const src=syncEverywhere.toString();
-    return src.indexOf('apiSyncPlans') < src.indexOf('pushToCloud');
+  // GitHub Pages: GitHub login only. The Worker database is a different host.
+  ck("this origin is detected as GitHub Pages", await p.evaluate(()=>isGitHubHost()===true));
+  ck("GitHub login button is visible", await p.evaluate(()=>{
+    const b=document.querySelector('#btnCloud');
+    return !!(b && b.style.display!=="none" && b.offsetParent);
   }));
-  ck("GitHub failures no longer interrupt (backup runs quiet)",
-    await p.evaluate(()=>syncEverywhere.toString().includes('quiet:true')));
-  ck("Sync button no longer demands a GitHub token",
-    await p.evaluate(()=>!document.querySelector('#btnSync').onclick.toString().includes('openCloudModal')));
+  ck("account login is hidden on GitHub Pages", await p.evaluate(()=>{
+    const b=document.querySelector('#btnAccount');
+    return !b || b.style.display==="none";
+  }));
+  ck("database button is hidden on GitHub Pages", await p.evaluate(()=>{
+    const b=document.querySelector('#btnDb');
+    return !b || b.style.display==="none";
+  }));
+  ck("landing gate is not forced on GitHub Pages", await p.evaluate(()=>!document.querySelector('#gateOverlay').classList.contains('show')));
+  ck("saving a plan still goes through the host-aware sync", await p.evaluate(()=>savePlan.toString().includes('syncEverywhere')));
+  ck("GitHub Pages sync writes GitHub, not the Worker database", await p.evaluate(()=>{
+    const src=syncEverywhere.toString();
+    return src.includes('isGitHubHost') && src.includes('pushToCloud');
+  }));
+  ck("Sync without a token opens GitHub sign-in",
+    await p.evaluate(()=>document.querySelector('#btnSync').onclick.toString().includes('openCloudModal')));
   ck("sync sends tombstones so deletions propagate",
     await p.evaluate(()=>apiSyncPlans.toString().includes('__deleted__')));
   ck("a 401 from the database drops the signed-in state rather than looping",

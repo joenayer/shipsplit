@@ -211,6 +211,10 @@
   .ghtab{flex:1;border:1px solid var(--line);background:#fff;border-radius:7px;padding:7px 10px;cursor:pointer;font-size:13px;font-weight:600;color:var(--muted)}
   .ghtab:hover{background:#eef3f8}
   .ghtab.active{background:var(--blue-soft);border-color:var(--blue);color:var(--blue)}
+  .overlay.gate{z-index:120}
+  #acctOverlay{z-index:130}
+  .gate-actions{display:flex;flex-direction:column;gap:8px;margin-top:4px}
+  .gate-actions .btn{width:100%;padding:10px 12px;font-size:14px}
   .recovery{display:flex;flex-direction:column;gap:9px}
   .recstep{border:1px solid var(--line);border-radius:8px;padding:8px 10px;font-size:12px;line-height:1.5;color:var(--ink)}
   .recstep b{font-weight:600}
@@ -420,6 +424,18 @@
     </div>
   </div>
 </div>
+<!-- Cloudflare host: must pick Sign in or Guest before using the app. No dismiss. -->
+<div class="overlay gate" id="gateOverlay">
+  <div class="modal" style="width:400px" role="dialog" aria-labelledby="gateTitle" aria-modal="true">
+    <h3 id="gateTitle">Welcome to ShipSplit</h3>
+    <div class="sub" style="margin-bottom:14px">Choose one. Signed-in shipments live in your account. Guest mode stays on this device only.</div>
+    <div class="gate-actions">
+      <button type="button" class="btn primary" id="btnGateSignin">Sign in</button>
+      <button type="button" class="btn" id="btnGateGuest">Continue as guest</button>
+    </div>
+    <div class="sub" style="margin-top:12px">You can sign in later from the header if you start as a guest.</div>
+  </div>
+</div>
 <!-- ShipSplit account (the API that stores documents) -->
 <div class="overlay" id="acctOverlay">
   <div class="modal" style="width:400px">
@@ -427,7 +443,7 @@
     <div class="sub" id="acctStatus" style="margin-bottom:10px">Checking…</div>
 
     <div id="acctForm">
-      <div class="sub" style="margin-bottom:8px">This is separate from GitHub sync. It stores shipment documents — invoices, labels, packing lists — and gives you a password you can actually recover.</div>
+      <div class="sub" style="margin-bottom:8px">Your account stores plans and shipment documents. Sign in on any device with this email and password.</div>
       <div class="field" style="margin-bottom:8px"><label>Email</label><input id="acctEmail" autocomplete="username" placeholder="you@example.com"></div>
       <div class="field" style="margin-bottom:8px"><label>Password</label><input type="password" id="acctPass" autocomplete="current-password" placeholder="At least 8 characters"></div>
       <div style="display:flex;gap:8px;margin-top:10px">
